@@ -1,46 +1,38 @@
-/**
- * Session client - high-level interface for calling the supervisor model.
- */
-
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import type { SteeringDecision } from '../types.js';
+import type { AdvisorDecision, AdvisorModelBinding } from '../types.js';
 import { SupervisorSession } from './supervisor-session.js';
-import { parseDecision, safeContinue } from './response-parser.js';
+import { parseDecision, unknown } from './response-parser.js';
 
-// Global session manager (one per supervision goal)
-let activeSession: SupervisorSession | null = null;
+let activeSession: SupervisorSession | undefined;
+let activeKey: string | undefined;
 
-function getOrCreateSession(): SupervisorSession {
-  if (!activeSession) {
-    activeSession = new SupervisorSession();
-  }
-  return activeSession;
-}
-
-/** Dispose the global supervisor session. */
-export function disposeSession(): void {
+export function disposeAdvisorSession(): void {
   activeSession?.dispose();
-  activeSession = null;
+  activeSession = undefined;
+  activeKey = undefined;
 }
 
-/**
- * Run a one-shot supervisor analysis using reusable session.
- * Returns { action: "continue" } on any failure so the chat is never interrupted.
- */
-export async function callSupervisorModel(
+export async function callAdvisorModel(
   ctx: ExtensionContext,
-  provider: string,
-  modelId: string,
+  binding: AdvisorModelBinding,
   systemPrompt: string,
   userPrompt: string,
-  signal?: AbortSignal,
-  onDelta?: (accumulated: string) => void
-): Promise<SteeringDecision> {
-  const session = getOrCreateSession();
-  const started = await session.ensureStarted(ctx, provider, modelId, systemPrompt);
-  if (!started) return safeContinue('Failed to start supervisor session');
-
-  const text = await session.prompt(userPrompt, signal, onDelta);
-  if (text === null) return safeContinue('Model call failed');
-  return parseDecision(text);
+  signal?: AbortSignal
+): Promise<AdvisorDecision> {
+  const key = `${ctx.cwd}\u0000${binding.provider}\u0000${binding.modelId}\u0000${binding.effort}`;
+  if (!activeSession || activeKey !== key) {
+    disposeAdvisorSession();
+    activeSession = new SupervisorSession();
+    activeKey = key;
+  }
+  const started = await activeSession.ensureStarted(
+    ctx,
+    binding.provider,
+    binding.modelId,
+    systemPrompt,
+    binding.effort
+  );
+  if (!started) return unknown('advisor model session could not start');
+  const text = await activeSession.prompt(userPrompt, signal);
+  return text === null ? unknown('advisor model call failed') : parseDecision(text);
 }

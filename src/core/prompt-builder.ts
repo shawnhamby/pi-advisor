@@ -1,137 +1,62 @@
-/**
- * Prompt builder - constructs user prompts for the supervisor LLM
- * using structured compaction output instead of raw message dumps.
- */
+import type { AdvisorState } from '../types.js';
 
-import type { SupervisorState, SupervisorIntervention } from '../types.js';
-import { getReframeGuidance } from './reframe.js';
+export const ADVISOR_SYSTEM_PROMPT = `You are Advisor, an independent read-only execution monitor for a coding agent.
 
-/** Build the user-facing prompt for the supervisor LLM. */
-export function buildUserPrompt(
-  state: SupervisorState,
-  contextText: string,
-  agentIsIdle: boolean,
-  ineffectivePattern?: { detected: boolean; similarCount: number; secondsSinceLastSteer: number }
+Judge the user's exact objective against runtime evidence. Protect intent from narrowing, detect narrated work without execution, unresolved tool errors, stale or missing validation, unsupported task evidence, incomplete criteria, ignored instructions, fake waiting, and evidence-free completion. A plan is binding only when supplied by path and digest. Task state is execution evidence, not user authority.
+
+You may return one concise warning, one bounded next action, a blocker, a completion reconciliation, or an answer to a direct Advisor question. Never perform work, invent evidence, grant user authority, accept formal review, stop a process, impersonate the user, or create new scope. A real blocker stays a blocker. Silence is correct for productive work without a concrete problem.
+
+For automatic settled checks, PASS means the objective is demonstrably complete from supplied evidence; GAP means a specific obligation remains; UNKNOWN means evidence or routing is insufficient. For direct questions, answer the question and do not rewrite the objective unless the user's wording is clearly an explicit correction.
+
+When a later trusted user input explicitly replaces or corrects the objective, return its exact supplied at timestamp as objectiveInputAt. Never rewrite the user's objective text. Omit objectiveInputAt for questions, side requests, ambiguous steering, or unchanged intent.
+
+Return strict JSON only:
+{"verdict":"PASS|GAP|UNKNOWN","action":"silent|warn|continue|blocker|answer","message":"optional concise text","reasoning":"brief evidence basis","confidence":0.0,"objectiveInputAt":123}`;
+
+export function buildAdvisorPrompt(
+  state: AdvisorState,
+  transcript: string,
+  mode: 'automatic' | 'question',
+  question?: string,
+  hostContext?: string
 ): string {
-  // Build intervention history with full ASI display
-  const interventionHistory =
-    state.interventions.length === 0
-      ? 'None yet.'
-      : state.interventions
-          .slice(-5)
-          .map((iv, i) => {
-            let entry = `[${i + 1}] "${iv.message}"`;
-
-            if (iv.asi && Object.keys(iv.asi).length > 0) {
-              const asiEntries = Object.entries(iv.asi)
-                .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
-                .join(', ');
-              entry += `\n    ASI {${asiEntries}}`;
-            }
-            return entry;
-          })
-          .join('\n');
-
-  // Build ASI pattern summary for loop closing
-  const asiSummary = buildASISummary(state.interventions);
-
-  const agentStatus = agentIsIdle
-    ? `AGENT STATUS: IDLE — the agent has finished its turn and is now waiting for user input.
-You MUST return "done" or "steer". Returning "continue" here means the agent stays idle forever.`
-    : `AGENT STATUS: WORKING — the agent is actively processing. Only intervene if clearly off track.`;
-
-  const reframeGuidance = getReframeGuidance(state.reframeTier ?? 0, ineffectivePattern);
-  const reframeSection = reframeGuidance ? `\n${reframeGuidance}\n` : '';
-
-  const contextBlock = contextText
-    ? `STRUCTURED CONVERSATION CONTEXT:\n${contextText}`
-    : '(No conversation context available)';
-
-  return `DESIRED OUTCOME:
-${state.outcome}
-
-${agentStatus}${reframeSection}
-
-${contextBlock}
-
-YOUR INTERVENTION HISTORY (with ASI observations):
-${interventionHistory}
-
-${asiSummary}
-REMINDER — DESIRED OUTCOME:
-${state.outcome}
-
-Has this outcome been fully achieved? Analyze and respond with JSON only.`;
+  const activeTask = taskSummary(state.taskState);
+  const toolEvidence = state.toolEvidence.slice(-16).map((item) => ({
+    id: item.toolCallId,
+    tool: item.toolName,
+    error: item.isError,
+    output: item.outputPreview,
+    at: item.finishedAt,
+  }));
+  return [
+    `MODE: ${mode}`,
+    question ? `DIRECT USER QUERY: ${question}` : '',
+    `OBJECTIVE: ${state.objective ?? 'unbound'}`,
+    `TRUSTED USER INPUTS: ${JSON.stringify(state.trustedInputs.slice(-12))}`,
+    `PLAN: ${state.plan ? `${state.plan.path} sha256:${state.plan.digest}` : 'none'}`,
+    `TASK STATE: ${JSON.stringify(activeTask)}`,
+    `TOUCHED FILES: ${JSON.stringify(state.touchedFiles)}`,
+    `LAST VALIDATION: ${state.validationAt ?? 'none'}`,
+    `BLOCKERS: ${JSON.stringify(state.blockers)}`,
+    `PENDING TOOLS: ${JSON.stringify(Object.values(state.activeTools))}`,
+    `INSTRUCTION SOURCES: ${JSON.stringify(state.instructions)}`,
+    `RUNTIME EVIDENCE: ${JSON.stringify(toolEvidence)}`,
+    hostContext ? `HOST-VERIFIED CONTEXT:\n${hostContext}` : '',
+    'STRUCTURED CONVERSATION:',
+    transcript || '(none)',
+    mode === 'automatic'
+      ? 'Reconcile completion and return only a concrete high-signal intervention.'
+      : 'Answer the direct user query against the current objective and evidence.',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
-/** Build summary of ASI patterns to close the loop */
-function buildASISummary(interventions: SupervisorIntervention[]): string {
-  if (interventions.length === 0) return '';
-
-  const patterns: string[] = [];
-  const recent = interventions.slice(-5);
-
-  const keyFrequency: Record<string, number> = {};
-  for (const iv of recent) {
-    if (!iv.asi) continue;
-    for (const key of Object.keys(iv.asi)) {
-      keyFrequency[key] = (keyFrequency[key] || 0) + 1;
-    }
-  }
-
-  for (const [key, count] of Object.entries(keyFrequency)) {
-    if (count >= 2) {
-      patterns.push(`Pattern seen ${count}x: "${key}"`);
-    }
-  }
-
-  const allValues = recent
-    .filter((iv) => iv.asi)
-    .flatMap((iv) => Object.values(iv.asi!))
-    .map((v) => String(v).toLowerCase());
-
-  const suspiciousIndicators = [
-    'unverified',
-    'contradict',
-    'suspicious',
-    'fake',
-    'skip',
-    'manipulat',
-    'cheat',
-    'gaming',
-    'short-circuit',
-  ];
-
-  const hasSuspicious = suspiciousIndicators.some((indicator) =>
-    allValues.some((v) => v.includes(indicator))
-  );
-
-  if (hasSuspicious) {
-    patterns.push(
-      '⚠️ Previous interventions flagged suspicious claims — require explicit proof before accepting "done"'
-    );
-  }
-
-  const verificationFailures = interventions.filter(
-    (iv) =>
-      iv.asi &&
-      Object.entries(iv.asi).some(
-        ([k, v]) =>
-          String(v).toLowerCase().includes('contradict') ||
-          String(v).toLowerCase().includes('unverified')
-      )
-  ).length;
-
-  if (verificationFailures >= 2) {
-    patterns.push(
-      `⚠️ ${verificationFailures} interventions involved unverified/contradicted claims — agent has pattern of unreliable reporting`
-    );
-  }
-
-  if (patterns.length === 0) return '';
-
-  return `ASI PATTERN SUMMARY (use this to inform your decision):
-${patterns.map((p) => `- ${p}`).join('\n')}
-
-`;
+function taskSummary(value: unknown): unknown {
+  if (!value || typeof value !== 'object') return null;
+  const event = value as { state?: { activeTaskId?: string; tasks?: Record<string, unknown> } };
+  const state = event.state;
+  if (!state) return null;
+  const id = state.activeTaskId;
+  return id ? { activeTaskId: id, task: state.tasks?.[id] } : { activeTaskId: null };
 }

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.0
+
+- Replace opt-in supervision with an always-loaded, signal-activated Advisor.
+- Add runtime-backed task evidence and one-use completion permits.
+- Preserve trusted input provenance and agent-attributed messaging.
+- Add native-compaction continuity without replacing Pi summaries.
+- Remove project prompt discovery, model config writes, child-process scans,
+  user impersonation, start/stop tools, and unbounded reframing.
+
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
 ### [0.5.5](https://github.com/monotykamary/pi-supervisor/compare/v0.5.4...v0.5.5) (2026-07-08)
