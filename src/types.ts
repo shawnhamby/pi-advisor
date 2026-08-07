@@ -1,42 +1,68 @@
-/**
- * Core types for the pi-supervisor extension.
- */
+import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
 
-/** A single intervention record */
-export interface SupervisorIntervention {
-  message: string;
-  reasoning: string;
-  timestamp: number;
-  asi?: InterventionASI;
-}
+export type AdvisorSeverity = 'nit' | 'concern' | 'blocker';
 
-/** Reframe tier tracks escalation of intervention strategies */
-export type ReframeTier = 0 | 1 | 2 | 3 | 4;
-
-/** Actionable Side Information — free-form observations from interventions */
-export interface InterventionASI {
-  [key: string]: unknown;
-}
-
-/** Full supervisor state — persisted to session */
-export interface SupervisorState {
-  active: boolean;
-  outcome: string;
+export type AdvisorModelBinding = {
+  selector: string;
   provider: string;
   modelId: string;
-  interventions: SupervisorIntervention[];
-  startedAt: number;
-  reframeTier?: ReframeTier;
-  /** Consecutive agent_end steers; reset on done/stop/new supervision */
-  idleSteers?: number;
-  /** Whether we just steered and should verify on next mid-run event */
-}
+  effort: string;
+  family: string;
+};
 
-/** Decision returned by the supervisor LLM */
-export interface SteeringDecision {
-  action: 'continue' | 'steer' | 'done';
+export type InstructionReference = {
+  id: string;
+  digest?: string;
+};
+
+export type PlanBinding = {
+  path: string;
+  digest: string;
+};
+
+export type ToolEvidence = {
+  toolCallId: string;
+  toolName: string;
+  input: Record<string, unknown>;
+  isError: boolean;
+  outputDigest: string;
+  outputPreview: string;
+  finishedAt: number;
+};
+
+export type AdvisorState = {
+  version: 1;
+  objective?: string;
+  objectiveUpdatedAt?: number;
+  plan?: PlanBinding;
+  taskState?: unknown;
+  taskReason?: string;
+  instructions: InstructionReference[];
+  touchedFiles: string[];
+  validationAt?: number;
+  blockers: string[];
+  toolEvidence: ToolEvidence[];
+  activeTools: Record<string, { name: string; startedAt: number }>;
+  lastTrustedInput?: { text: string; source: 'interactive' | 'rpc'; at: number };
+  trustedInputs: Array<{ text: string; source: 'interactive' | 'rpc'; at: number }>;
+  lastAnalysisAt?: number;
+  lastEmissionSignature?: string;
+  lastEmissionAt?: number;
+  completionPermit?: { digest: string; taskId: string; createdAt: number };
+  continuationIssuedFor?: string;
+  pendingContinuity?: boolean;
+};
+
+export type AdvisorDecision = {
+  verdict: 'PASS' | 'GAP' | 'UNKNOWN';
+  action: 'silent' | 'warn' | 'continue' | 'blocker' | 'answer';
   message?: string;
   reasoning: string;
   confidence: number;
-  asi?: InterventionASI;
-}
+  objectiveInputAt?: number;
+};
+
+export type AdvisorHostOptions = {
+  resolveModel(ctx: ExtensionContext): Promise<AdvisorModelBinding | undefined>;
+  resolveContext?(ctx: ExtensionContext, state: AdvisorState): Promise<string>;
+};

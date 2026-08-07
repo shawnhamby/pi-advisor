@@ -9,7 +9,7 @@ import {
   getAgentDir,
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
-import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { CreateAgentSessionOptions, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 export class SupervisorSession {
   private session: Awaited<ReturnType<typeof createAgentSession>>['session'] | null = null;
@@ -20,7 +20,8 @@ export class SupervisorSession {
     ctx: ExtensionContext,
     provider: string,
     modelId: string,
-    systemPrompt: string
+    systemPrompt: string,
+    effort: string
   ): Promise<boolean> {
     // If model or system prompt changed, need new session
     const newModel = ctx.modelRegistry.find(provider, modelId);
@@ -50,6 +51,7 @@ export class SupervisorSession {
         sessionManager: SessionManager.inMemory(),
         agentDir: getAgentDir(),
         model: newModel,
+        thinkingLevel: effort as NonNullable<CreateAgentSessionOptions['thinkingLevel']>,
         tools: [],
         resourceLoader: loader,
       });
