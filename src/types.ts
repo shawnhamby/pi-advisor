@@ -1,4 +1,12 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type {
+  AstMatcher,
+  ToolSnapshot,
+  WatchContract,
+  WatchEngineState,
+  WatchInput,
+  WatchMatch,
+} from './watch/types.js';
 
 export type AdvisorSeverity = 'nit' | 'concern' | 'blocker';
 
@@ -24,6 +32,7 @@ export type ToolEvidence = {
   toolCallId: string;
   toolName: string;
   input: Record<string, unknown>;
+  validation?: boolean;
   isError: boolean;
   outputDigest: string;
   outputPreview: string;
@@ -51,6 +60,9 @@ export type AdvisorState = {
   completionPermit?: { digest: string; taskId: string; createdAt: number };
   continuationIssuedFor?: string;
   pendingContinuity?: boolean;
+  watch?: WatchEngineState;
+  pendingSemanticMatches?: WatchMatch[];
+  completionRequested?: { taskId: string; at: number };
 };
 
 export type AdvisorDecision = {
@@ -65,4 +77,14 @@ export type AdvisorDecision = {
 export type AdvisorHostOptions = {
   resolveModel(ctx: ExtensionContext): Promise<AdvisorModelBinding | undefined>;
   resolveContext?(ctx: ExtensionContext, state: AdvisorState): Promise<string>;
+  watchContract?: WatchContract;
+  matchAst?: AstMatcher;
+  resolveToolSnapshots?(
+    ctx: ExtensionContext,
+    event: {
+      toolName: string;
+      input: Record<string, unknown>;
+      isError: boolean;
+    }
+  ): Promise<ToolSnapshot[]>;
 };

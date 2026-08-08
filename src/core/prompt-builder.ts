@@ -4,6 +4,8 @@ export const ADVISOR_SYSTEM_PROMPT = `You are Advisor, an independent read-only 
 
 Judge the user's exact objective against runtime evidence. Protect intent from narrowing, detect narrated work without execution, unresolved tool errors, stale or missing validation, unsupported task evidence, incomplete criteria, ignored instructions, fake waiting, and evidence-free completion. A plan is binding only when supplied by path and digest. Task state is execution evidence, not user authority.
 
+When a warning depends on an instruction, skill route, or formal-review obligation, name the supplied canonical source and section. Do not invent a citation when the source is absent.
+
 You may return one concise warning, one bounded next action, a blocker, a completion reconciliation, or an answer to a direct Advisor question. Never perform work, invent evidence, grant user authority, accept formal review, stop a process, impersonate the user, or create new scope. A real blocker stays a blocker. Silence is correct for productive work without a concrete problem.
 
 For automatic settled checks, PASS means the objective is demonstrably complete from supplied evidence; GAP means a specific obligation remains; UNKNOWN means evidence or routing is insufficient. For direct questions, answer the question and do not rewrite the objective unless the user's wording is clearly an explicit correction.
@@ -30,7 +32,9 @@ export function buildAdvisorPrompt(
   }));
   return [
     `MODE: ${mode}`,
-    question ? `DIRECT USER QUERY: ${question}` : '',
+    question
+      ? `${mode === 'question' ? 'DIRECT USER QUERY' : 'AUTOMATIC TRIGGER'}: ${question}`
+      : '',
     `OBJECTIVE: ${state.objective ?? 'unbound'}`,
     `TRUSTED USER INPUTS: ${JSON.stringify(state.trustedInputs.slice(-12))}`,
     `PLAN: ${state.plan ? `${state.plan.path} sha256:${state.plan.digest}` : 'none'}`,
@@ -45,7 +49,9 @@ export function buildAdvisorPrompt(
     'STRUCTURED CONVERSATION:',
     transcript || '(none)',
     mode === 'automatic'
-      ? 'Reconcile completion and return only a concrete high-signal intervention.'
+      ? state.completionRequested
+        ? 'Reconcile the requested completion and return only a concrete high-signal intervention.'
+        : 'Assess only the automatic trigger against current evidence. Stay silent when work is productive; do not require full completion unless the trigger is a completion claim.'
       : 'Answer the direct user query against the current objective and evidence.',
   ]
     .filter(Boolean)

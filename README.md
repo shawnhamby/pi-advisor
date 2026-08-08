@@ -13,6 +13,10 @@ the authority model:
   task reducer runs;
 - final completion requires a current one-use permit from a settled check;
 - messages are agent-attributed Pi custom messages, never user impersonation;
+- an OMP-derived deterministic watch lane observes bounded text, thinking,
+  tool, result, task, and lifecycle streams without calling a model;
+- host-supplied regex and AST rules can remind at a safe boundary or schedule
+  one semantic check, but cannot block tools or grant authority;
 - native Pi remains the compaction owner, with a single continuity reminder
   after compaction;
 - the only command is `/advisor`, optionally followed by a natural-language
@@ -37,6 +41,9 @@ export default createAdvisorExtension({
       family: 'different-family',
     };
   },
+  watchContract,
+  matchAst: workspaceAstMatcher,
+  resolveToolSnapshots: workspaceSnapshotResolver,
 });
 ```
 
@@ -49,7 +56,8 @@ credentials, and instruction topology out of the public package.
 The Advisor does not perform work, grant user authority, formally accept a
 change, create project configuration, discover project prompt files, scan for
 child processes, stop or restart sessions, or maintain a second compaction
-summary.
+summary. The public package ships no policy rule pack and does not discover
+repository-controlled rules. A host must admit its own watch contract.
 
 ## Development
 
@@ -64,3 +72,10 @@ The isolated model session and algorithmic conversation-compaction pipeline are
 derived from `monotykamary/pi-supervisor`, itself derived from earlier
 `pi-supervisor` work. The fork retains the MIT license and substantially narrows
 runtime authority, lifecycle, and completion behavior.
+
+The deterministic watch engine is adapted from Oh My Pi's TTSR architecture at
+commit `08819b279cf02ae2545e69dad7111ab48d91d35e`. It retains bounded
+source-aware buffers, regex/AST predicates, path/tool scoping, repeat policy,
+and persisted violation-signature deduplication while omitting OMP rule
+discovery, opinion packs, interrupt/retry ownership, memory, todos, and
+model-on-every-turn behavior.

@@ -17,6 +17,8 @@ export function gateTaskCall(
   const task = activeTask(manager.get().taskState);
 
   if (event.toolName === 'task_evidence') {
+    // pi-tasks exposes the tool argument as the string enum "true" while its
+    // reducer stores the normalized evidence value as boolean true.
     if (
       input.type === 'user_acceptance' &&
       !trustedUserAcceptance(manager.get().lastTrustedInput)
@@ -69,6 +71,7 @@ export function gateTaskCall(
       return reject('Skipped acceptance criteria require explicit, runtime-proven user direction');
     }
     if (!manager.consumePermit(task.id)) {
+      manager.markCompletionRequested(task.id);
       return reject(
         'Advisor has not issued a current one-use completion permit; reconcile the settled task first'
       );

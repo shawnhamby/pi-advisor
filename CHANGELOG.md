@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Add a generic OMP-derived deterministic watch engine for bounded assistant,
+  tool, task, and lifecycle streams.
+- Add host-owned regex/AST rule admission, snapshot resolution, persisted
+  deduplication, and semantic-trigger escalation.
+- Keep reminders separate from tool results so evidence digests and compaction
+  provenance remain exact.
+- Run automatic model checks only for semantic watch signals or an explicit
+  completion request; `/advisor` remains an on-demand direct check.
+
 ## 0.1.0
 
 - Replace opt-in supervision with an always-loaded, signal-activated Advisor.

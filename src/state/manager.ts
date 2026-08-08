@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AdvisorState, PlanBinding, ToolEvidence } from '../types.js';
+import type { WatchEngineState, WatchMatch } from '../watch/types.js';
 
 const ADVISOR_STATE_ENTRY = 'pi-advisor-state';
 const MAX_TOOL_EVIDENCE = 40;
@@ -26,6 +27,7 @@ export class AdvisorStateManager {
         ? structuredClone(entry.data)
         : emptyState();
     this.state.trustedInputs ??= [];
+    this.state.pendingSemanticMatches ??= [];
     this.state.activeTools = {};
   }
 
@@ -45,6 +47,10 @@ export class AdvisorStateManager {
     const effectiveAt = Math.max(at, priorAt + 1);
     this.state.lastTrustedInput = { text: trimmed, source, at: effectiveAt };
     this.state.trustedInputs.push({ text: trimmed, source, at: effectiveAt });
+    this.state.completionPermit = undefined;
+    this.state.completionRequested = undefined;
+    this.state.continuationIssuedFor = undefined;
+    this.state.pendingSemanticMatches = [];
     if (this.state.trustedInputs.length > MAX_TRUSTED_INPUTS) {
       this.state.trustedInputs.splice(0, this.state.trustedInputs.length - MAX_TRUSTED_INPUTS);
     }
@@ -68,11 +74,16 @@ export class AdvisorStateManager {
   setPlan(plan: PlanBinding | undefined): void {
     if (JSON.stringify(this.state.plan) !== JSON.stringify(plan)) {
       this.state.completionPermit = undefined;
+      this.state.completionRequested = undefined;
     }
     this.state.plan = plan;
   }
 
   setInstructions(instructions: AdvisorState['instructions']): void {
+    if (JSON.stringify(this.state.instructions) !== JSON.stringify(instructions)) {
+      this.state.completionPermit = undefined;
+      this.state.completionRequested = undefined;
+    }
     this.state.instructions = instructions;
   }
 
@@ -80,6 +91,41 @@ export class AdvisorStateManager {
     this.state.taskState = structuredClone(value);
     this.state.taskReason = reason;
     this.state.completionPermit = undefined;
+    this.state.completionRequested = undefined;
+  }
+
+  setWatchState(value: WatchEngineState): void {
+    this.state.watch = structuredClone(value);
+  }
+
+  queueSemanticMatches(matches: WatchMatch[]): void {
+    this.state.pendingSemanticMatches ??= [];
+    const existing = new Set(this.state.pendingSemanticMatches.map((match) => match.signature));
+    for (const match of matches) {
+      if (existing.has(match.signature)) continue;
+      this.state.pendingSemanticMatches.push(structuredClone(match));
+      existing.add(match.signature);
+    }
+    if (this.state.pendingSemanticMatches.length > 12)
+      this.state.pendingSemanticMatches.splice(0, this.state.pendingSemanticMatches.length - 12);
+  }
+
+  semanticMatches(): WatchMatch[] {
+    return structuredClone(this.state.pendingSemanticMatches ?? []);
+  }
+
+  clearSemanticMatches(): void {
+    this.state.pendingSemanticMatches = [];
+  }
+
+  markCompletionRequested(taskId: string): void {
+    this.state.completionRequested = { taskId, at: Date.now() };
+    this.state.completionPermit = undefined;
+    this.persist();
+  }
+
+  clearCompletionRequest(): void {
+    this.state.completionRequested = undefined;
   }
 
   toolStarted(id: string, name: string, input: Record<string, unknown>): void {
@@ -87,7 +133,10 @@ export class AdvisorStateManager {
     if (isMutationTool(name)) {
       for (const file of extractPaths(input)) this.addTouchedFile(file);
     }
-    if (isMutationTool(name) || isShellTool(name)) this.state.completionPermit = undefined;
+    if (isMutationTool(name) || isShellTool(name)) {
+      this.state.completionPermit = undefined;
+      this.state.completionRequested = undefined;
+    }
   }
 
   toolFinished(evidence: ToolEvidence): void {
@@ -121,6 +170,7 @@ export class AdvisorStateManager {
   issuePermit(taskId: string): string {
     const digest = stateDigest(this.state, taskId);
     this.state.completionPermit = { digest, taskId, createdAt: Date.now() };
+    this.state.completionRequested = undefined;
     this.persist();
     return digest;
   }
@@ -238,9 +288,7 @@ function extractPaths(input: Record<string, unknown>): string[] {
 }
 
 function isValidationTool(evidence: ToolEvidence): boolean {
-  if (evidence.isError) return false;
-  const text = `${evidence.toolName} ${JSON.stringify(evidence.input)}`.toLowerCase();
-  return /(?:test|check|lint|typecheck|verify|diagnostic|build)/.test(text);
+  return !evidence.isError && evidence.validation === true;
 }
 
 function isMutationTool(name: string): boolean {

@@ -5,6 +5,7 @@ import type {
   BeforeAgentStartEvent,
   ExtensionAPI,
   ExtensionContext,
+  MessageUpdateEvent,
   ToolCallEvent,
   ToolResultEvent,
 } from '@earendil-works/pi-coding-agent';
@@ -22,6 +23,8 @@ import type {
   PlanBinding,
   ToolEvidence,
 } from './types.js';
+import { WatchEngine } from './watch/engine.js';
+import type { WatchInput, WatchMatch } from './watch/types.js';
 
 const TASK_STATE_EVENT = 'pi-tasks:state';
 const ADVISOR_MESSAGE = 'pi-advisor';
@@ -39,6 +42,36 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     let substantial = false;
     let routeLabel: string | undefined;
     let automaticCheckActive = false;
+    let watcher = options.watchContract
+      ? new WatchEngine(options.watchContract, options.matchAst)
+      : undefined;
+    let watchQueue = Promise.resolve<WatchMatch[]>([]);
+    let pendingReminders: WatchMatch[] = [];
+
+    const watch = (input: WatchInput): Promise<WatchMatch[]> => {
+      const activeWatcher = watcher;
+      if (!activeWatcher) return Promise.resolve([]);
+      const run = watchQueue.then(() => activeWatcher.evaluate(input));
+      const safeRun = run.catch(() => []);
+      watchQueue = safeRun;
+      return safeRun.then((matches) => {
+        if (watcher !== activeWatcher) return [];
+        if (!matches.length) return matches;
+        const semantic = matches
+          .filter((match) => match.effect === 'semantic')
+          .map((match) => ({
+            ...match,
+            observedEvidenceCount: manager.get().toolEvidence.length,
+          }));
+        const reminders = matches.filter((match) => match.effect === 'remind');
+        if (semantic.length) manager.queueSemanticMatches(semantic);
+        if (reminders.length) pendingReminders.push(...reminders);
+        manager.setWatchState(watcher!.exportState());
+        manager.persist();
+        if (matches.some((match) => match.activates)) substantial = true;
+        return matches;
+      });
+    };
 
     const emit = (
       message: string,
@@ -50,7 +83,12 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (!trimmed) return;
       const signature = digest(`${severity}\u0000${trimmed}`);
       if (!manager.emissionAllowed(signature)) return;
-      const details = { notes: [{ note: trimmed, severity }], route: routeLabel };
+      const details = {
+        notes: [{ note: trimmed, severity }],
+        route: routeLabel,
+        source: 'advisor',
+        agentAttributed: true,
+      };
       pi.sendMessage(
         {
           customType: ADVISOR_MESSAGE,
@@ -100,19 +138,29 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       manager.setTaskState(value, reason);
       substantial = true;
       manager.persist();
+      void watch({ source: 'task', content: JSON.stringify(value), snapshot: true });
     });
 
     pi.on('session_start', (_event, ctx) => {
       manager.load(ctx);
+      watcher = options.watchContract
+        ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
+        : undefined;
+      watchQueue = Promise.resolve([]);
+      pendingReminders = [];
       pendingInputs.clear();
-      substantial =
-        !!manager.get().objective &&
-        (!!manager.get().plan || !!activeTask(manager.get().taskState));
+      substantial = substantialState(manager.get());
     });
 
     pi.on('session_tree', (_event, ctx) => {
       manager.load(ctx);
+      watcher = options.watchContract
+        ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
+        : undefined;
+      watchQueue = Promise.resolve([]);
+      pendingReminders = [];
       pendingInputs.clear();
+      substantial = substantialState(manager.get());
     });
 
     pi.on('input', (event) => {
@@ -137,6 +185,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
 
     pi.on('before_agent_start', async (event, ctx) => {
       await applyPromptMetadata(event, ctx);
+      void watch({
+        source: 'signal',
+        content: `instructions:${digest(event.systemPrompt)}`,
+        snapshot: true,
+      });
       const reminder = manager.takeContinuityReminder();
       if (!reminder) return undefined;
       pi.events.emit(CONTINUITY_EVENT, {
@@ -152,6 +205,95 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       };
     });
 
+    pi.on('turn_start', (event) => {
+      watcher?.resetTurn();
+      void watch({
+        source: 'lifecycle',
+        content: `turn_start ${event.turnIndex}`,
+        snapshot: true,
+      });
+    });
+
+    pi.on('agent_start', () => {
+      void watch({ source: 'lifecycle', content: 'agent_start', snapshot: true });
+    });
+
+    pi.on('agent_end', () => {
+      void watch({ source: 'lifecycle', content: 'agent_end', snapshot: true });
+    });
+
+    pi.on('message_update', (event: MessageUpdateEvent) => {
+      const update = event.assistantMessageEvent;
+      if (update.type === 'text_delta') {
+        void watch({
+          source: 'text',
+          content: update.delta,
+          streamKey: `text:${update.contentIndex}`,
+        });
+      } else if (update.type === 'thinking_delta') {
+        void watch({
+          source: 'thinking',
+          content: update.delta,
+          streamKey: `thinking:${update.contentIndex}`,
+        });
+      } else if (update.type === 'toolcall_delta') {
+        const partial = update.partial.content[update.contentIndex];
+        void watch({
+          source: 'tool',
+          toolName: partial?.type === 'toolCall' ? partial.name : undefined,
+          content: update.delta,
+          streamKey: `tool:${update.contentIndex}`,
+        });
+      } else if (update.type === 'toolcall_end') {
+        const input = update.toolCall.arguments as Record<string, unknown>;
+        void watch({
+          source: 'tool',
+          toolName: update.toolCall.name,
+          content: JSON.stringify(input),
+          streamKey: `tool:${update.toolCall.id}`,
+          filePaths: extractPaths(input),
+          snapshot: true,
+        });
+      }
+    });
+
+    pi.on('message_end', (event) => {
+      if (event.message.role !== 'assistant') return;
+      const content = Array.isArray(event.message.content) ? event.message.content : [];
+      const text = content
+        .filter((item: any) => item?.type === 'text')
+        .map((item: any) => String(item.text ?? ''))
+        .join('\n');
+      const thinking = content
+        .filter((item: any) => item?.type === 'thinking')
+        .map((item: any) => String(item.thinking ?? item.text ?? ''))
+        .join('\n');
+      if (text)
+        void watch({ source: 'text', content: text, streamKey: 'text:final', snapshot: true });
+      if (thinking)
+        void watch({
+          source: 'thinking',
+          content: thinking,
+          streamKey: 'thinking:final',
+          snapshot: true,
+        });
+    });
+
+    pi.on('turn_end', (event) => {
+      const turnWatcher = watcher;
+      void watch({
+        source: 'lifecycle',
+        content: `turn_end ${event.turnIndex}`,
+        snapshot: true,
+      }).finally(() => {
+        if (turnWatcher && watcher === turnWatcher) {
+          turnWatcher.finishTurn();
+          manager.setWatchState(turnWatcher.exportState());
+          manager.persist();
+        }
+      });
+    });
+
     pi.on('tool_call', (event: ToolCallEvent) => {
       const blocked = gateTaskCall(event, manager);
       if (blocked?.block) return blocked;
@@ -160,10 +302,18 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       manager.toolStarted(event.toolCallId, event.toolName, input);
       if (HIGH_SIGNAL_TOOLS.test(event.toolName)) substantial = true;
       activityEpoch++;
+      void watch({
+        source: 'tool',
+        toolName: event.toolName,
+        content: JSON.stringify(input),
+        streamKey: `tool:${event.toolCallId}`,
+        filePaths: extractPaths(input),
+        snapshot: true,
+      });
       return undefined;
     });
 
-    pi.on('tool_result', (event: ToolResultEvent) => {
+    pi.on('tool_result', async (event: ToolResultEvent, ctx) => {
       const pending = pendingInputs.get(event.toolCallId);
       pendingInputs.delete(event.toolCallId);
       const output = event.content
@@ -172,16 +322,50 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       const evidence: ToolEvidence = {
         toolCallId: event.toolCallId,
         toolName: event.toolName,
-        input: pending?.input ?? event.input,
+        input: evidenceInput(pending?.input ?? event.input),
+        validation: looksLikeValidation(event.toolName, pending?.input ?? event.input),
         isError: event.isError,
         outputDigest: digest(output),
-        outputPreview: output.replace(/\s+/g, ' ').trim().slice(0, 280),
+        outputPreview: redactEvidencePreview(output).replace(/\s+/g, ' ').trim().slice(0, 280),
         finishedAt: Date.now(),
       };
       manager.toolFinished(evidence);
       if (MUTATION_TOOLS.test(event.toolName)) substantial = true;
       manager.persist();
       activityEpoch++;
+      await watch({
+        source: 'tool-result',
+        toolName: event.toolName,
+        content: `isError:${event.isError}\n${output}`,
+        streamKey: `tool-result:${event.toolCallId}`,
+        filePaths: extractPaths(pending?.input ?? event.input),
+        snapshot: true,
+      });
+      if (!event.isError && options.resolveToolSnapshots) {
+        let snapshots: Awaited<ReturnType<NonNullable<typeof options.resolveToolSnapshots>>> = [];
+        try {
+          snapshots = await options.resolveToolSnapshots(ctx, {
+            toolName: event.toolName,
+            input: pending?.input ?? event.input,
+            isError: event.isError,
+          });
+        } catch {
+          snapshots = [];
+        }
+        for (const snapshot of snapshots) {
+          await watch({
+            source: 'tool',
+            toolName: event.toolName,
+            content: snapshot.content,
+            streamKey: `snapshot:${snapshot.path}`,
+            filePaths: [snapshot.path],
+            language: snapshot.language,
+            snapshot: true,
+          });
+        }
+      }
+      for (const reminder of pendingReminders.splice(0))
+        emit(reminderText(reminder), reminder.severity, ctx);
     });
 
     pi.on('agent_settled', async (_event, ctx) => {
@@ -189,34 +373,80 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
       const task = activeTask(manager.get().taskState);
       if (task?.task?.status === 'done' || task?.task?.status === 'cancelled') return;
+      await watch({
+        source: 'lifecycle',
+        content: `agent_settled substantial:${substantial} task:${task ? 'active' : 'none'} validation:${manager.get().validationAt ? 'present' : 'missing'} mutations:${manager.get().touchedFiles.length}`,
+        snapshot: true,
+      });
+      if (pendingReminders.length && !ctx.hasPendingMessages()) {
+        for (const reminder of pendingReminders.splice(0))
+          emit(reminderText(reminder), reminder.severity, ctx);
+      }
+      const pendingSemanticMatches = manager.semanticMatches();
+      const semanticMatches = pendingSemanticMatches.filter(
+        (match) =>
+          match.settledCondition !== 'no-later-tool' ||
+          manager.get().toolEvidence.length <= (match.observedEvidenceCount ?? 0)
+      );
+      if (semanticMatches.length !== pendingSemanticMatches.length) {
+        manager.clearSemanticMatches();
+        manager.queueSemanticMatches(semanticMatches);
+      }
+      const completionRequested = manager.get().completionRequested;
+      if (!semanticMatches.length && !completionRequested) {
+        manager.persist();
+        return;
+      }
       automaticCheckActive = true;
       try {
         const binding = await resolveBinding(ctx);
         if (!binding) {
-          if (task)
-            emit(
-              'Advisor could not run the required different-family completion check; the task remains active.',
-              'blocker',
-              ctx
-            );
+          emit(
+            task || completionRequested
+              ? 'Advisor could not run the required different-family completion check; the task remains active.'
+              : 'Advisor could not run the different-family semantic check; the deterministic warning remains unresolved.',
+            task || completionRequested ? 'blocker' : 'concern',
+            ctx
+          );
           return;
         }
         const startInputEpoch = inputEpoch;
         const startActivityEpoch = activityEpoch;
-        const decision = await analyze(
-          ctx,
-          binding,
-          manager.get(),
-          'automatic',
-          undefined,
-          await resolveHostContext(ctx)
-        );
+        let decision: AdvisorDecision;
+        try {
+          decision = await analyze(
+            ctx,
+            binding,
+            manager.get(),
+            'automatic',
+            semanticMatches.length
+              ? `Deterministic watch signals:\n${semanticMatches
+                  .map(
+                    (match) =>
+                      `- ${match.ruleId}: ${match.message}${match.provenance?.source ? ` [source: ${match.provenance.source}]` : ''}`
+                  )
+                  .join('\n')}`
+              : completionRequested
+                ? `Completion requested for ${completionRequested.taskId}.`
+                : undefined,
+            await resolveHostContext(ctx)
+          );
+        } catch (error) {
+          if (startInputEpoch === inputEpoch && startActivityEpoch === activityEpoch)
+            emit(
+              `Advisor check failed: ${error instanceof Error ? error.message : String(error)}`,
+              completionRequested ? 'blocker' : 'concern',
+              ctx
+            );
+          return;
+        }
         if (
           startInputEpoch !== inputEpoch ||
           startActivityEpoch !== activityEpoch ||
           ctx.hasPendingMessages()
         )
           return;
+        manager.clearSemanticMatches();
         manager.markAnalyzed();
         handleDecision(decision, ctx, task?.id);
         manager.persist();
@@ -235,7 +465,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       }
       const message = decision.message?.trim();
       if (decision.verdict === 'PASS') {
-        if (taskId) {
+        const completionRequest = manager.get().completionRequested;
+        if (taskId && completionRequest?.taskId === taskId) {
           const permit = manager.issuePermit(taskId);
           const continuation = `Completion evidence reconciled. Submit the existing task completion once with its supported evidence. Permit ${permit.slice(0, 12)}.`;
           if (!ctx.hasPendingMessages() && manager.markContinuation(`complete:${permit}`))
@@ -257,7 +488,12 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     pi.on('session_before_compact', () => manager.persist());
     pi.on('session_compact', (_event, ctx) => {
       manager.load(ctx);
+      watcher = options.watchContract
+        ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
+        : undefined;
+      watchQueue = Promise.resolve([]);
       manager.markContinuityPending();
+      void watch({ source: 'lifecycle', content: 'session_compact', snapshot: true });
       disposeAdvisorSession();
     });
 
@@ -265,7 +501,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       routeLabel = undefined;
       disposeAdvisorSession();
     });
-    pi.on('session_shutdown', () => disposeAdvisorSession());
+    pi.on('session_shutdown', () => {
+      if (watcher) manager.setWatchState(watcher.exportState());
+      manager.persist();
+      disposeAdvisorSession();
+    });
 
     pi.registerCommand('advisor', {
       description: 'Ask the always-on execution advisor or inspect current completion status',
@@ -288,14 +528,24 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           );
           return;
         }
-        const decision = await analyze(
-          ctx,
-          binding,
-          manager.get(),
-          'question',
-          question || 'Report current status and completion truth.',
-          await resolveHostContext(ctx)
-        );
+        let decision: AdvisorDecision;
+        try {
+          decision = await analyze(
+            ctx,
+            binding,
+            manager.get(),
+            'question',
+            question || 'Report current status and completion truth.',
+            await resolveHostContext(ctx)
+          );
+        } catch (error) {
+          emit(
+            `Advisor question failed: ${error instanceof Error ? error.message : String(error)}`,
+            'blocker',
+            ctx
+          );
+          return;
+        }
         if (decision.objectiveInputAt !== undefined) {
           manager.applyObjectiveInput(decision.objectiveInputAt);
         }
@@ -405,9 +655,70 @@ function statusText(
   return `${verdict}: ${reason}\nObjective: ${state.objective ?? 'unbound'}\nPlan: ${state.plan ? `${state.plan.path} (${state.plan.digest.slice(0, 12)})` : 'none'}\nTask: ${task ? `${task.id} ${task.task.status ?? 'unknown'}` : 'none'}\nBlockers: ${state.blockers.length ? state.blockers.join('; ') : 'none'}`;
 }
 
+function substantialState(state: ReturnType<AdvisorStateManager['get']>): boolean {
+  return (
+    !!state.objective &&
+    (!!state.plan ||
+      !!activeTask(state.taskState) ||
+      state.touchedFiles.length > 0 ||
+      state.toolEvidence.length > 0)
+  );
+}
+
+function reminderText(match: WatchMatch): string {
+  return `[${match.ruleId}] ${match.message}${match.provenance?.source ? ` Source: ${match.provenance.source}.` : ''}`;
+}
+
 function digest(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function extractPaths(input: Record<string, unknown>): string[] {
+  return [
+    ...new Set(
+      [input.path, input.file, input.filePath, input.file_path, input.target]
+        .filter((value): value is string => typeof value === 'string')
+        .map((value) => value.replaceAll('\\', '/').replace(/^\.\//, ''))
+    ),
+  ];
+}
+
+function evidenceInput(input: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(
+    ['path', 'file', 'filePath', 'file_path', 'target', 'task_id', 'step_id', 'type']
+      .filter((key) => typeof input[key] === 'string')
+      .map((key) => [key, input[key]])
+  );
+}
+
+function looksLikeValidation(toolName: string, input: Record<string, unknown>): boolean {
+  const command = typeof input.command === 'string' ? input.command : '';
+  return /(?:test|check|lint|typecheck|verify|diagnostic|build)/i.test(`${toolName} ${command}`);
+}
+
+function redactEvidencePreview(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [redacted]')
+    .replace(
+      /\b(authorization|api[_-]?key|token|password|secret)\s*[:=]\s*["']?[^\s"',}]+/gi,
+      '$1=[redacted]'
+    )
+    .replace(/\b(?:sk|dk|ghp|github_pat)-[A-Za-z0-9_-]{8,}\b/g, '[redacted credential]');
+}
+
 export { CONTINUITY_EVENT };
 export type { AdvisorHostOptions, AdvisorModelBinding } from './types.js';
+export { validateWatchContract, WatchEngine } from './watch/engine.js';
+export type {
+  AstMatchRequest,
+  AstMatcher,
+  ToolSnapshot,
+  WatchContract,
+  WatchEffect,
+  WatchEngineState,
+  WatchInput,
+  WatchInterruptMode,
+  WatchMatch,
+  WatchRule,
+  WatchSource,
+} from './watch/types.js';
