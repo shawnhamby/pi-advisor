@@ -38,6 +38,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     let activityEpoch = 0;
     let substantial = false;
     let routeLabel: string | undefined;
+    let automaticCheckActive = false;
 
     const emit = (
       message: string,
@@ -119,6 +120,19 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       inputEpoch++;
       manager.bindTrustedInput(event.text, event.source);
       manager.persist();
+      if (!automaticCheckActive || event.streamingBehavior) return;
+
+      // Pi marks the main session idle while awaiting agent_settled handlers. If the
+      // user submits during that window, an Advisor continuation can otherwise start
+      // between input preflight and dispatch, causing Pi to reject the user message.
+      // Cancel the stale check and resubmit once with an explicit lane so the message
+      // is valid whether the main session is still idle or has just resumed.
+      disposeAdvisorSession();
+      const content = event.images?.length
+        ? [{ type: 'text' as const, text: event.text }, ...event.images]
+        : event.text;
+      pi.sendUserMessage(content, { deliverAs: 'steer' });
+      return { action: 'handled' as const };
     });
 
     pi.on('before_agent_start', async (event, ctx) => {
@@ -175,35 +189,40 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
       const task = activeTask(manager.get().taskState);
       if (task?.task?.status === 'done' || task?.task?.status === 'cancelled') return;
-      const binding = await resolveBinding(ctx);
-      if (!binding) {
-        if (task)
-          emit(
-            'Advisor could not run the required different-family completion check; the task remains active.',
-            'blocker',
-            ctx
-          );
-        return;
+      automaticCheckActive = true;
+      try {
+        const binding = await resolveBinding(ctx);
+        if (!binding) {
+          if (task)
+            emit(
+              'Advisor could not run the required different-family completion check; the task remains active.',
+              'blocker',
+              ctx
+            );
+          return;
+        }
+        const startInputEpoch = inputEpoch;
+        const startActivityEpoch = activityEpoch;
+        const decision = await analyze(
+          ctx,
+          binding,
+          manager.get(),
+          'automatic',
+          undefined,
+          await resolveHostContext(ctx)
+        );
+        if (
+          startInputEpoch !== inputEpoch ||
+          startActivityEpoch !== activityEpoch ||
+          ctx.hasPendingMessages()
+        )
+          return;
+        manager.markAnalyzed();
+        handleDecision(decision, ctx, task?.id);
+        manager.persist();
+      } finally {
+        automaticCheckActive = false;
       }
-      const startInputEpoch = inputEpoch;
-      const startActivityEpoch = activityEpoch;
-      const decision = await analyze(
-        ctx,
-        binding,
-        manager.get(),
-        'automatic',
-        undefined,
-        await resolveHostContext(ctx)
-      );
-      if (
-        startInputEpoch !== inputEpoch ||
-        startActivityEpoch !== activityEpoch ||
-        ctx.hasPendingMessages()
-      )
-        return;
-      manager.markAnalyzed();
-      handleDecision(decision, ctx, task?.id);
-      manager.persist();
     });
 
     const handleDecision = (
