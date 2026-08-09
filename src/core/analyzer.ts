@@ -12,9 +12,10 @@ export async function analyze(
   ctx: ExtensionContext,
   binding: AdvisorModelBinding,
   state: AdvisorState,
-  mode: 'automatic' | 'question',
+  mode: 'automatic' | 'question' | 'mutation',
   question?: string,
-  hostContext?: string
+  hostContext?: string,
+  signal: AbortSignal | undefined = ctx.signal
 ): Promise<AdvisorDecision> {
   const transcript = formatForSupervisor(buildCompactionSummary(extractMessages(ctx)));
   return callAdvisorModel(
@@ -22,6 +23,6 @@ export async function analyze(
     binding,
     ADVISOR_SYSTEM_PROMPT,
     buildAdvisorPrompt(state, transcript, mode, question, hostContext),
-    ctx.signal
+    signal
   );
 }

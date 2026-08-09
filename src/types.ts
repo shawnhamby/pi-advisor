@@ -74,6 +74,8 @@ export type AdvisorDecision = {
   objectiveInputAt?: number;
 };
 
+export type MutationIntent = 'authorized' | 'read-only' | 'ambiguous';
+
 export type AdvisorHostOptions = {
   resolveModel(ctx: ExtensionContext): Promise<AdvisorModelBinding | undefined>;
   resolveContext?(ctx: ExtensionContext, state: AdvisorState): Promise<string>;

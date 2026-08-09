@@ -11,6 +11,8 @@ the authority model:
 - `pi-tasks` state and actual tool results back completion decisions;
 - task evidence, step closure, and final completion can be blocked before the
   task reducer runs;
+- file-changing tools are preflighted against the latest trusted user input so
+  analysis-only requests cannot silently become implementation work;
 - final completion requires a current one-use permit from a settled check;
 - messages are agent-attributed Pi custom messages, never user impersonation;
 - an OMP-derived deterministic watch lane observes bounded text, thinking,
@@ -21,6 +23,11 @@ the authority model:
   after compaction;
 - the only command is `/advisor`, optionally followed by a natural-language
   question or explicit correction.
+
+When the user submits input during an automatic settled check, Advisor cancels
+the stale check and hands that input back to Pi's normal steering lane exactly
+once. Advisor model-routing failures are reported once per unchanged failure
+instead of repeating after every settled turn.
 
 ## Host integration
 

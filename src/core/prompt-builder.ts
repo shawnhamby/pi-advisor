@@ -10,6 +10,8 @@ You may return one concise warning, one bounded next action, a blocker, a comple
 
 For automatic settled checks, PASS means the objective is demonstrably complete from supplied evidence; GAP means a specific obligation remains; UNKNOWN means evidence or routing is insufficient. For direct questions, answer the question and do not rewrite the objective unless the user's wording is clearly an explicit correction.
 
+For mutation preflight, PASS only when the latest trusted user input explicitly directs or approves the proposed mutation. GAP means the request is clearly analysis, review, explanation, recommendation, or discussion without implementation authority. UNKNOWN means the wording is genuinely ambiguous. Never infer approval of other work merely because the user rejected one option. A short approval such as "agreed" or "do it" authorizes only the concrete proposal immediately preceding it.
+
 When a later trusted user input explicitly replaces or corrects the objective, return its exact supplied at timestamp as objectiveInputAt. Never rewrite the user's objective text. Omit objectiveInputAt for questions, side requests, ambiguous steering, or unchanged intent.
 
 Return strict JSON only:
@@ -18,7 +20,7 @@ Return strict JSON only:
 export function buildAdvisorPrompt(
   state: AdvisorState,
   transcript: string,
-  mode: 'automatic' | 'question',
+  mode: 'automatic' | 'question' | 'mutation',
   question?: string,
   hostContext?: string
 ): string {
@@ -33,7 +35,7 @@ export function buildAdvisorPrompt(
   return [
     `MODE: ${mode}`,
     question
-      ? `${mode === 'question' ? 'DIRECT USER QUERY' : 'AUTOMATIC TRIGGER'}: ${question}`
+      ? `${mode === 'question' ? 'DIRECT USER QUERY' : mode === 'mutation' ? 'PROPOSED MUTATION' : 'AUTOMATIC TRIGGER'}: ${question}`
       : '',
     `OBJECTIVE: ${state.objective ?? 'unbound'}`,
     `TRUSTED USER INPUTS: ${JSON.stringify(state.trustedInputs.slice(-12))}`,
@@ -52,7 +54,9 @@ export function buildAdvisorPrompt(
       ? state.completionRequested
         ? 'Reconcile the requested completion and return only a concrete high-signal intervention.'
         : 'Assess only the automatic trigger against current evidence. Stay silent when work is productive; do not require full completion unless the trigger is a completion claim.'
-      : 'Answer the direct user query against the current objective and evidence.',
+      : mode === 'mutation'
+        ? 'Classify only whether the latest real user input authorizes this mutation. Return PASS only for explicit authority, GAP for a clear read-only request, and UNKNOWN for ambiguity.'
+        : 'Answer the direct user query against the current objective and evidence.',
   ]
     .filter(Boolean)
     .join('\n\n');

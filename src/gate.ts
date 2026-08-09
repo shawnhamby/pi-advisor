@@ -1,5 +1,6 @@
 import type { ToolCallEvent, ToolCallEventResult } from '@earendil-works/pi-coding-agent';
 import { activeTask, AdvisorStateManager } from './state/manager.js';
+import type { MutationIntent } from './types.js';
 
 const COMPLETION_TOOLS = new Set([
   'task_evidence',
@@ -7,6 +8,28 @@ const COMPLETION_TOOLS = new Set([
   'task_update',
   'task_complete',
 ]);
+
+const IMPLEMENTATION_VERB =
+  '(?:implement|fix|edit|modify|delete|refactor|deploy|install|configure|enable|disable|land|commit|merge|push|revert|undo|back out)';
+const DIRECT_MUTATION_REQUEST = new RegExp(
+  `(?:^|[.!?;]\\s+|\\band\\s+)(?:please\\s+)?${IMPLEMENTATION_VERB}\\b|\\b(?:can|could|would|will)\\s+you\\s+(?:please\\s+)?${IMPLEMENTATION_VERB}\\b`,
+  'i'
+);
+const CONTRADICTED_MUTATION =
+  /\b(?:no|not|nothing|never|don't|dont|do not|later|not yet|for now|hold off|never mind|nevermind)\b/i;
+const READ_ONLY_REQUEST =
+  /\b(?:examine|inspect|review|analy[sz]e|investigate|compare|explain|recommend|consider|discuss|walk me through|tell me|what|why|how|should we|could we|can we|do we|is there|are there)\b/i;
+
+export function classifyMutationIntent(text: string | undefined): MutationIntent {
+  const normalized = text?.trim() ?? '';
+  if (!normalized) return 'ambiguous';
+  const mutation = DIRECT_MUTATION_REQUEST.test(normalized);
+  const readOnly = READ_ONLY_REQUEST.test(normalized);
+  if (mutation && (readOnly || CONTRADICTED_MUTATION.test(normalized))) return 'ambiguous';
+  if (mutation) return 'authorized';
+  if (readOnly) return 'read-only';
+  return 'ambiguous';
+}
 
 export function gateTaskCall(
   event: ToolCallEvent,

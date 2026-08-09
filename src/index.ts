@@ -11,7 +11,7 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { Container, Text } from '@earendil-works/pi-tui';
 import { analyze } from './core/analyzer.js';
-import { gateTaskCall } from './gate.js';
+import { classifyMutationIntent, gateTaskCall } from './gate.js';
 import { disposeAdvisorSession } from './session/client.js';
 import { activeTask, AdvisorStateManager } from './state/manager.js';
 import type {
@@ -31,7 +31,8 @@ const ADVISOR_MESSAGE = 'pi-advisor';
 const CONTINUITY_EVENT = 'pi-advisor:continuity-restored';
 const HIGH_SIGNAL_TOOLS =
   /^(?:bash|exec|edit|write|task_plan|task_update|task_evidence|task_complete|spawn_agent|create_thread)$/i;
-const MUTATION_TOOLS = /(?:edit|write|patch|delete|create|rename|move)/i;
+const MUTATION_TOOLS = /^(?:edit|write|patch|apply_patch|delete|rename|move|readSeek_rename)$/i;
+const MUTATION_INTENT_TIMEOUT_MS = 10_000;
 
 export function createAdvisorExtension(options: AdvisorHostOptions) {
   return function advisorExtension(pi: ExtensionAPI): void {
@@ -42,6 +43,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     let substantial = false;
     let routeLabel: string | undefined;
     let automaticCheckActive = false;
+    let automaticRouteFailure: string | undefined;
+    let mutationIntentCache: { inputAt: number; allowed: boolean; reason?: string } | undefined;
     let watcher = options.watchContract
       ? new WatchEngine(options.watchContract, options.matchAst)
       : undefined;
@@ -103,21 +106,97 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     };
 
     const resolveBinding = async (
-      ctx: ExtensionContext
+      ctx: ExtensionContext,
+      reportFailure = true
     ): Promise<AdvisorModelBinding | undefined> => {
       try {
         const binding = await options.resolveModel(ctx);
         routeLabel = binding?.selector;
+        if (binding) automaticRouteFailure = undefined;
         return binding;
       } catch (error) {
         routeLabel = undefined;
-        emit(
-          `Advisor route failed: ${error instanceof Error ? error.message : String(error)}`,
-          'blocker',
-          ctx
-        );
+        const message = `Advisor route failed: ${error instanceof Error ? error.message : String(error)}`;
+        if (reportFailure && automaticRouteFailure !== message) {
+          automaticRouteFailure = message;
+          emit(message, 'blocker', ctx);
+        }
         return undefined;
       }
+    };
+
+    const mutationGate = async (
+      event: ToolCallEvent,
+      ctx: ExtensionContext
+    ): Promise<{ block: true; terminate: true; reason: string } | undefined> => {
+      if (!MUTATION_TOOLS.test(event.toolName)) return undefined;
+      const input = manager.get().lastTrustedInput;
+      const deterministic = classifyMutationIntent(input?.text);
+      if (deterministic === 'authorized') return undefined;
+      if (deterministic === 'read-only') {
+        return {
+          block: true,
+          terminate: true,
+          reason:
+            'The latest real user input requests analysis or discussion, not implementation. Do not modify files until the user explicitly asks for the change.',
+        };
+      }
+      if (input && mutationIntentCache?.inputAt === input.at) {
+        return mutationIntentCache.allowed
+          ? undefined
+          : {
+              block: true,
+              terminate: true,
+              reason:
+                mutationIntentCache.reason ??
+                'The latest real user input does not clearly authorize implementation.',
+            };
+      }
+      const startInputEpoch = inputEpoch;
+      const binding = await resolveBinding(ctx, false);
+      if (!binding) {
+        return {
+          block: true,
+          terminate: true,
+          reason:
+            'Mutation paused because the latest user input is ambiguous and no eligible Advisor route is available to classify it.',
+        };
+      }
+      let decision: AdvisorDecision;
+      try {
+        const timeout = AbortSignal.timeout(MUTATION_INTENT_TIMEOUT_MS);
+        const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout;
+        decision = await analyze(
+          ctx,
+          binding,
+          manager.get(),
+          'mutation',
+          `${event.toolName} ${JSON.stringify(extractPaths(event.input))}`,
+          undefined,
+          signal
+        );
+      } catch (error) {
+        return {
+          block: true,
+          terminate: true,
+          reason: `Mutation paused because Advisor intent classification failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+      }
+      if (startInputEpoch !== inputEpoch || manager.get().lastTrustedInput?.at !== input?.at) {
+        return {
+          block: true,
+          terminate: true,
+          reason: 'Mutation paused because newer user input arrived during intent classification.',
+        };
+      }
+      const allowed = decision.verdict === 'PASS' && decision.confidence >= 0.7;
+      const reason =
+        decision.message?.trim() ||
+        (decision.verdict === 'UNKNOWN'
+          ? 'The latest real user input is ambiguous; ask before modifying files.'
+          : 'The latest real user input does not authorize implementation.');
+      if (input) mutationIntentCache = { inputAt: input.at, allowed, reason };
+      return allowed ? undefined : { block: true, terminate: true, reason };
     };
 
     const applyPromptMetadata = async (
@@ -149,6 +228,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       watchQueue = Promise.resolve([]);
       pendingReminders = [];
       pendingInputs.clear();
+      automaticRouteFailure = undefined;
+      mutationIntentCache = undefined;
       substantial = substantialState(manager.get());
     });
 
@@ -160,6 +241,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       watchQueue = Promise.resolve([]);
       pendingReminders = [];
       pendingInputs.clear();
+      automaticRouteFailure = undefined;
+      mutationIntentCache = undefined;
       substantial = substantialState(manager.get());
     });
 
@@ -167,6 +250,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (event.source !== 'interactive' && event.source !== 'rpc') return;
       inputEpoch++;
       manager.bindTrustedInput(event.text, event.source);
+      mutationIntentCache = undefined;
       manager.persist();
       if (!automaticCheckActive || event.streamingBehavior) return;
 
@@ -294,9 +378,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       });
     });
 
-    pi.on('tool_call', (event: ToolCallEvent) => {
+    pi.on('tool_call', async (event: ToolCallEvent, ctx) => {
       const blocked = gateTaskCall(event, manager);
       if (blocked?.block) return blocked;
+      const mutationBlocked = await mutationGate(event, ctx);
+      if (mutationBlocked) return mutationBlocked;
       const input = structuredClone(event.input as Record<string, unknown>);
       pendingInputs.set(event.toolCallId, { name: event.toolName, input });
       manager.toolStarted(event.toolCallId, event.toolName, input);
@@ -399,15 +485,16 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       }
       automaticCheckActive = true;
       try {
-        const binding = await resolveBinding(ctx);
+        const binding = await resolveBinding(ctx, false);
         if (!binding) {
-          emit(
+          const message =
             task || completionRequested
               ? 'Advisor could not run the required different-family completion check; the task remains active.'
-              : 'Advisor could not run the different-family semantic check; the deterministic warning remains unresolved.',
-            task || completionRequested ? 'blocker' : 'concern',
-            ctx
-          );
+              : 'Advisor could not run the different-family semantic check; the deterministic warning remains unresolved.';
+          if (automaticRouteFailure !== message) {
+            automaticRouteFailure = message;
+            emit(message, task || completionRequested ? 'blocker' : 'concern', ctx);
+          }
           return;
         }
         const startInputEpoch = inputEpoch;
@@ -499,6 +586,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
 
     pi.on('model_select', () => {
       routeLabel = undefined;
+      automaticRouteFailure = undefined;
+      mutationIntentCache = undefined;
       disposeAdvisorSession();
     });
     pi.on('session_shutdown', () => {

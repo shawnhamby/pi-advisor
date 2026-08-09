@@ -10,6 +10,11 @@
   provenance remain exact.
 - Run automatic model checks only for semantic watch signals or an explicit
   completion request; `/advisor` remains an on-demand direct check.
+- Gate file-changing tools when the latest trusted user input is read-only or
+  does not clearly authorize implementation.
+- Preserve user input that arrives during an automatic settled check by
+  cancelling the stale check and resubmitting through Pi's steering lane.
+- Deduplicate unchanged automatic model-routing failures.
 
 ## 0.1.0
 
