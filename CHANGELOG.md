@@ -20,6 +20,8 @@
   escalation so productive work is quiet and repeated notes do not churn.
 - Give the isolated Advisor only bounded read, grep, and find tools rooted at
   the active workspace, with sanitized incremental transcript deltas.
+- Use the same bounded, role-aware sanitized snapshot for session priming,
+  completion checks, and direct questions.
 - Prime each reset Advisor generation once with mode-aware, host-verified
   instruction and skill context; refresh it only for semantic escalation,
   completion, or direct questions.

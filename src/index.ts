@@ -468,7 +468,9 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           manager.persist();
         }
       });
-      queuePrimaryDelta(ctx, turnIsInProgress(event.message));
+      if (substantial && manager.get().objective) {
+        queuePrimaryDelta(ctx, turnIsInProgress(event.message));
+      }
     });
 
     pi.on('tool_call', async (event: ToolCallEvent, ctx) => {
@@ -519,6 +521,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         filePaths: extractPaths(pending?.input ?? event.input),
         snapshot: true,
       });
+      const snapshotMatches: WatchMatch[] = [];
       if (!event.isError && options.resolveToolSnapshots) {
         let snapshots: Awaited<ReturnType<NonNullable<typeof options.resolveToolSnapshots>>> = [];
         try {
@@ -531,30 +534,35 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           snapshots = [];
         }
         for (const snapshot of snapshots) {
-          await watch({
-            source: 'tool',
-            toolName: event.toolName,
-            content: snapshot.content,
-            streamKey: `snapshot:${snapshot.path}`,
-            filePaths: [snapshot.path],
-            language: snapshot.language,
-            snapshot: true,
-          });
+          snapshotMatches.push(
+            ...(await watch({
+              source: 'tool',
+              toolName: event.toolName,
+              content: snapshot.content,
+              streamKey: `snapshot:${snapshot.path}`,
+              filePaths: [snapshot.path],
+              language: snapshot.language,
+              snapshot: true,
+            }))
+          );
         }
       }
-      const reminders = [
-        ...(pendingReminders.get(event.toolCallId) ?? []),
-        ...resultMatches.filter((match) => match.effect === 'remind'),
-      ];
+      const reminders = uniqueMatches(
+        [
+          ...(pendingReminders.get(event.toolCallId) ?? []),
+          ...resultMatches,
+          ...snapshotMatches,
+        ].filter((match) => match.effect === 'remind')
+      );
       pendingReminders.delete(event.toolCallId);
       for (const reminder of reminders) emit(reminderText(reminder), reminder.severity, ctx);
     });
 
-    pi.on('agent_settled', (_event, ctx) => {
+    pi.on('agent_settled', async (_event, ctx) => {
       if (!substantial || !manager.get().objective) return;
       if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
       const task = activeTask(manager.get().taskState);
-      void watch({
+      await watch({
         source: 'lifecycle',
         content: `agent_settled substantial:${substantial} task:${task ? 'active' : 'none'} validation:${manager.get().validationAt ? 'present' : 'missing'} mutations:${manager.get().touchedFiles.length}`,
         snapshot: true,

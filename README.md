@@ -3,8 +3,8 @@
 An evidence-aware execution advisor for [Pi](https://github.com/earendil-works/pi).
 
 This is a narrow fork of `@monotykamary/pi-supervisor` that keeps its useful
-algorithmic conversation compaction and isolated-model session, while changing
-the authority model:
+isolated-model session while replacing automatic full-transcript review with
+bounded, role-aware snapshots and changing the authority model:
 
 - supervision is always loaded and incrementally shadows every primary turn in
   a nonblocking, coalescing background lane;
@@ -88,10 +88,11 @@ pnpm typecheck
 
 ## Attribution
 
-The isolated model session and algorithmic conversation-compaction pipeline are
-derived from `monotykamary/pi-supervisor`, itself derived from earlier
-`pi-supervisor` work. The fork retains the MIT license and substantially narrows
-runtime authority, lifecycle, and completion behavior.
+The isolated model session and retained compaction utilities are derived from
+`monotykamary/pi-supervisor`, itself derived from earlier `pi-supervisor` work.
+The active Advisor path uses role-aware sanitized snapshots. The fork retains
+the MIT license and substantially narrows runtime authority, lifecycle, and
+completion behavior.
 
 The deterministic watch engine is adapted from Oh My Pi's TTSR architecture at
 commit `08819b279cf02ae2545e69dad7111ab48d91d35e`. It retains bounded

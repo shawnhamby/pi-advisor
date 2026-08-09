@@ -1,11 +1,10 @@
 const DEFAULT_LIMIT = 3_000;
-const HOST_LIMIT = 14_000;
-const SUMMARY_LIMIT = 18_000;
+const HOST_LIMIT = 52_000;
 
 const DIRECTIVE_LIKE =
-  /\b(?:ignore\s+(?:all\s+)?(?:prior|previous|earlier)\s+instructions|system\s+message|developer\s+message|you\s+are\s+now)\b/i;
+  /\b(?:ignore\s+(?:all\s+)?(?:prior|previous|earlier)\s+instructions|system\s+message|developer\s+message|you\s+are\s+now(?:\s+(?:the\s+)?(?:system|developer|administrator))?)\b/gi;
 
-export type CrossProviderSource = 'user' | 'assistant' | 'tool' | 'summary' | 'host';
+export type CrossProviderSource = 'user' | 'assistant' | 'tool' | 'host';
 
 export function sanitizeCrossProvider(value: string, source: CrossProviderSource): string {
   let text = redactCrossProviderSecrets(
@@ -19,9 +18,7 @@ export function sanitizeCrossProvider(value: string, source: CrossProviderSource
       /<\/?(?:system|developer|user|assistant|primary-transcript)\b[^>]*>/gi,
       '[quarantined role markup]'
     );
-    if (DIRECTIVE_LIKE.test(text)) {
-      text = `[quarantined directive-like ${source} content]`;
-    }
+    text = text.replace(DIRECTIVE_LIKE, `[quarantined directive-like ${source} span]`);
   }
   return bounded(text.trim(), limitFor(source));
 }
@@ -38,7 +35,6 @@ export function redactCrossProviderSecrets(value: string): string {
 
 function limitFor(source: CrossProviderSource): number {
   if (source === 'host') return HOST_LIMIT;
-  if (source === 'summary') return SUMMARY_LIMIT;
   return DEFAULT_LIMIT;
 }
 

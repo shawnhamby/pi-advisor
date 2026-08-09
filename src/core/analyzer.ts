@@ -1,9 +1,4 @@
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import {
-  buildCompactionSummary,
-  extractMessages,
-  formatForSupervisor,
-} from '../compaction/index.js';
 import { callAdvisorModel } from '../session/client.js';
 import type {
   AdvisorAnalysisMode,
@@ -12,6 +7,7 @@ import type {
   AdvisorState,
 } from '../types.js';
 import { ADVISOR_SYSTEM_PROMPT, buildAdvisorPrompt } from './prompt-builder.js';
+import { sanitizedTranscriptSnapshot } from './transcript-delta.js';
 
 export async function analyze(
   ctx: ExtensionContext,
@@ -23,8 +19,7 @@ export async function analyze(
   signal?: AbortSignal,
   transcriptOverride?: string
 ): Promise<AdvisorDecision> {
-  const transcript =
-    transcriptOverride ?? formatForSupervisor(buildCompactionSummary(extractMessages(ctx)));
+  const transcript = transcriptOverride ?? sanitizedTranscriptSnapshot(ctx) ?? '(none)';
   return callAdvisorModel(
     ctx,
     binding,

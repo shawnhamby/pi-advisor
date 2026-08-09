@@ -1,10 +1,6 @@
 import type { Message } from '@earendil-works/pi-ai';
 import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
-import {
-  buildCompactionSummary,
-  extractMessages,
-  formatForSupervisor,
-} from '../compaction/index.js';
+import { extractMessages } from '../compaction/index.js';
 import { sanitizeCrossProvider } from './cross-provider-sanitizer.js';
 
 const MAX_DELTA_CHARS = 14_000;
@@ -21,12 +17,7 @@ export class TranscriptDeltaRecorder {
   prime(ctx: ExtensionContext): string | undefined {
     const messages = extractMessages(ctx);
     this.cursor = messages.length;
-    if (!messages.length) return undefined;
-    const summary = sanitizeCrossProvider(
-      formatForSupervisor(buildCompactionSummary(messages)),
-      'summary'
-    );
-    return bounded(summary, MAX_PRIME_CHARS);
+    return renderSnapshot(messages);
   }
 
   take(ctx: ExtensionContext): string | undefined {
@@ -38,6 +29,16 @@ export class TranscriptDeltaRecorder {
     const rendered = fresh.map(renderMessage).filter(Boolean).join('\n\n');
     return rendered ? bounded(rendered, MAX_DELTA_CHARS) : undefined;
   }
+}
+
+export function sanitizedTranscriptSnapshot(ctx: ExtensionContext): string | undefined {
+  return renderSnapshot(extractMessages(ctx));
+}
+
+function renderSnapshot(messages: Message[]): string | undefined {
+  if (!messages.length) return undefined;
+  const rendered = messages.map(renderMessage).filter(Boolean).join('\n\n');
+  return rendered ? bounded(rendered, MAX_PRIME_CHARS) : undefined;
 }
 
 function renderMessage(message: Message): string {

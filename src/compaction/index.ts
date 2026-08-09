@@ -23,6 +23,7 @@ export function extractMessages(ctx: ExtensionContext): Message[] {
 /**
  * Build a structured compaction summary from branch messages.
  * One-shot, no merge, no state — fresh each time.
+ * @public Retained for direct consumers of the fork's compaction utilities.
  */
 export function buildCompactionSummary(messages: Message[]): SectionData {
   const blocks = filterNoise(normalize(messages));
@@ -32,6 +33,7 @@ export function buildCompactionSummary(messages: Message[]): SectionData {
 /**
  * Format SectionData as text for the supervisor prompt.
  * Uses cache-friendly section ordering (stable first, volatile last).
+ * @public Retained for direct consumers of the fork's compaction utilities.
  */
 export function formatForSupervisor(data: SectionData): string {
   return formatSummary(data);
