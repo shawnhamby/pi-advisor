@@ -265,7 +265,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
               binding,
               structuredClone(manager.get()),
               'completion',
-              `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${task.subject ?? ''}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
+              `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${sanitizeCrossProvider(String(task.subject ?? ''), 'tool')}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
               await resolveHostContext(ctx, 'completion', false),
               ctx.signal
             );
