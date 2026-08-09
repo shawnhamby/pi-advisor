@@ -8,10 +8,12 @@
   deduplication, and semantic-trigger escalation.
 - Keep reminders separate from tool results so evidence digests and compaction
   provenance remain exact.
-- Run automatic model checks only for semantic watch signals or an explicit
-  completion request; `/advisor` remains an on-demand direct check.
-- Gate file-changing tools when the latest trusted user input is read-only or
-  does not clearly authorize implementation.
+- Run automatic model checks only for semantic watch signals; `/advisor`
+  remains an on-demand direct check.
+- Check an agent's `TaskUpdate status=completed` request before it mutates task
+  state. A failed check returns a corrective tool error without terminating the
+  agent; user-driven `/tasks` transitions remain authoritative.
+- Never block execution tools, mutate task state, or issue completion permits.
 - Preserve user input that arrives during an automatic settled check by
   cancelling the stale check and resubmitting through Pi's steering lane.
 - Deduplicate unchanged automatic model-routing failures.

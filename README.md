@@ -9,11 +9,9 @@ the authority model:
 - supervision is always loaded and activates from real work signals;
 - interactive and RPC input are the only trusted user-input sources;
 - `pi-tasks` state and actual tool results back completion decisions;
-- task evidence, step closure, and final completion can be blocked before the
-  task reducer runs;
-- file-changing tools are preflighted against the latest trusted user input so
-  analysis-only requests cannot silently become implementation work;
-- final completion requires a current one-use permit from a settled check;
+- agent-requested task completion is checked before `TaskUpdate` can mark it complete;
+- an unsupported completion attempt returns one corrective tool error without terminating or pausing the agent;
+- direct user completion through `/tasks` remains user-authoritative and is reconciled after the transition;
 - messages are agent-attributed Pi custom messages, never user impersonation;
 - an OMP-derived deterministic watch lane observes bounded text, thinking,
   tool, result, task, and lifecycle streams without calling a model;
@@ -62,8 +60,11 @@ credentials, and instruction topology out of the public package.
 
 The Advisor does not perform work, grant user authority, formally accept a
 change, create project configuration, discover project prompt files, scan for
-child processes, stop or restart sessions, or maintain a second compaction
-summary. The public package ships no policy rule pack and does not discover
+child processes, stop or restart sessions, block execution tools, mutate task
+state, or maintain a second compaction summary. Its only gate is an agent's
+`TaskUpdate status=completed` request; rejection keeps the task active and the
+agent running. Shared hooks retain security and authorization enforcement. The
+public package ships no policy rule pack and does not discover
 repository-controlled rules. A host must admit its own watch contract.
 
 ## Development

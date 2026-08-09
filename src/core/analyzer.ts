@@ -12,7 +12,7 @@ export async function analyze(
   ctx: ExtensionContext,
   binding: AdvisorModelBinding,
   state: AdvisorState,
-  mode: 'automatic' | 'question' | 'mutation',
+  mode: 'automatic' | 'completion' | 'question',
   question?: string,
   hostContext?: string,
   signal: AbortSignal | undefined = ctx.signal

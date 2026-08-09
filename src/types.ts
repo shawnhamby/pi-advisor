@@ -57,12 +57,10 @@ export type AdvisorState = {
   lastAnalysisAt?: number;
   lastEmissionSignature?: string;
   lastEmissionAt?: number;
-  completionPermit?: { digest: string; taskId: string; createdAt: number };
   continuationIssuedFor?: string;
   pendingContinuity?: boolean;
   watch?: WatchEngineState;
   pendingSemanticMatches?: WatchMatch[];
-  completionRequested?: { taskId: string; at: number };
 };
 
 export type AdvisorDecision = {
@@ -73,8 +71,6 @@ export type AdvisorDecision = {
   confidence: number;
   objectiveInputAt?: number;
 };
-
-export type MutationIntent = 'authorized' | 'read-only' | 'ambiguous';
 
 export type AdvisorHostOptions = {
   resolveModel(ctx: ExtensionContext): Promise<AdvisorModelBinding | undefined>;

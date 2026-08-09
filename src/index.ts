@@ -7,11 +7,11 @@ import type {
   ExtensionContext,
   MessageUpdateEvent,
   ToolCallEvent,
+  ToolCallEventResult,
   ToolResultEvent,
 } from '@earendil-works/pi-coding-agent';
 import { Container, Text } from '@earendil-works/pi-tui';
 import { analyze } from './core/analyzer.js';
-import { classifyMutationIntent, gateTaskCall } from './gate.js';
 import { disposeAdvisorSession } from './session/client.js';
 import { activeTask, AdvisorStateManager } from './state/manager.js';
 import type {
@@ -30,9 +30,8 @@ const TASK_STATE_EVENT = 'pi-tasks:state';
 const ADVISOR_MESSAGE = 'pi-advisor';
 const CONTINUITY_EVENT = 'pi-advisor:continuity-restored';
 const HIGH_SIGNAL_TOOLS =
-  /^(?:bash|exec|edit|write|task_plan|task_update|task_evidence|task_complete|spawn_agent|create_thread)$/i;
+  /^(?:bash|exec|edit|write|TaskCreate|TaskUpdate|task_plan|task_update|task_evidence|task_complete|spawn_agent|create_thread)$/i;
 const MUTATION_TOOLS = /^(?:edit|write|patch|apply_patch|delete|rename|move|readSeek_rename)$/i;
-const MUTATION_INTENT_TIMEOUT_MS = 10_000;
 
 export function createAdvisorExtension(options: AdvisorHostOptions) {
   return function advisorExtension(pi: ExtensionAPI): void {
@@ -44,7 +43,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     let routeLabel: string | undefined;
     let automaticCheckActive = false;
     let automaticRouteFailure: string | undefined;
-    let mutationIntentCache: { inputAt: number; allowed: boolean; reason?: string } | undefined;
     let watcher = options.watchContract
       ? new WatchEngine(options.watchContract, options.matchAst)
       : undefined;
@@ -119,84 +117,10 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         const message = `Advisor route failed: ${error instanceof Error ? error.message : String(error)}`;
         if (reportFailure && automaticRouteFailure !== message) {
           automaticRouteFailure = message;
-          emit(message, 'blocker', ctx);
+          emit(message, 'concern', ctx);
         }
         return undefined;
       }
-    };
-
-    const mutationGate = async (
-      event: ToolCallEvent,
-      ctx: ExtensionContext
-    ): Promise<{ block: true; terminate: true; reason: string } | undefined> => {
-      if (!MUTATION_TOOLS.test(event.toolName)) return undefined;
-      const input = manager.get().lastTrustedInput;
-      const deterministic = classifyMutationIntent(input?.text);
-      if (deterministic === 'authorized') return undefined;
-      if (deterministic === 'read-only') {
-        return {
-          block: true,
-          terminate: true,
-          reason:
-            'The latest real user input requests analysis or discussion, not implementation. Do not modify files until the user explicitly asks for the change.',
-        };
-      }
-      if (input && mutationIntentCache?.inputAt === input.at) {
-        return mutationIntentCache.allowed
-          ? undefined
-          : {
-              block: true,
-              terminate: true,
-              reason:
-                mutationIntentCache.reason ??
-                'The latest real user input does not clearly authorize implementation.',
-            };
-      }
-      const startInputEpoch = inputEpoch;
-      const binding = await resolveBinding(ctx, false);
-      if (!binding) {
-        return {
-          block: true,
-          terminate: true,
-          reason:
-            'Mutation paused because the latest user input is ambiguous and no eligible Advisor route is available to classify it.',
-        };
-      }
-      let decision: AdvisorDecision;
-      try {
-        const timeout = AbortSignal.timeout(MUTATION_INTENT_TIMEOUT_MS);
-        const signal = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout;
-        decision = await analyze(
-          ctx,
-          binding,
-          manager.get(),
-          'mutation',
-          `${event.toolName} ${JSON.stringify(extractPaths(event.input))}`,
-          undefined,
-          signal
-        );
-      } catch (error) {
-        return {
-          block: true,
-          terminate: true,
-          reason: `Mutation paused because Advisor intent classification failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
-      }
-      if (startInputEpoch !== inputEpoch || manager.get().lastTrustedInput?.at !== input?.at) {
-        return {
-          block: true,
-          terminate: true,
-          reason: 'Mutation paused because newer user input arrived during intent classification.',
-        };
-      }
-      const allowed = decision.verdict === 'PASS' && decision.confidence >= 0.7;
-      const reason =
-        decision.message?.trim() ||
-        (decision.verdict === 'UNKNOWN'
-          ? 'The latest real user input is ambiguous; ask before modifying files.'
-          : 'The latest real user input does not authorize implementation.');
-      if (input) mutationIntentCache = { inputAt: input.at, allowed, reason };
-      return allowed ? undefined : { block: true, terminate: true, reason };
     };
 
     const applyPromptMetadata = async (
@@ -209,12 +133,93 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       manager.persist();
     };
 
+    const completionGate = async (
+      event: ToolCallEvent,
+      ctx: ExtensionContext
+    ): Promise<ToolCallEventResult | undefined> => {
+      if (event.toolName !== 'TaskUpdate') return undefined;
+      const input = event.input as Record<string, unknown>;
+      if (input.status !== 'completed') return undefined;
+
+      const taskId = typeof input.taskId === 'string' ? input.taskId : '';
+      const task = taskById(manager.get().taskState, taskId);
+      if (!task) {
+        return rejectCompletion(
+          `Task #${taskId || '?'} is not present in the current task state. Keep it active, refresh the task list, and retry completion.`
+        );
+      }
+      const blockers = openTaskBlockers(manager.get().taskState, task);
+      if (blockers.length) {
+        return rejectCompletion(
+          `Task #${taskId} is still blocked by ${blockers.map((id) => `#${id}`).join(', ')}. Resolve those tasks before retrying completion.`
+        );
+      }
+      if (Object.keys(manager.get().activeTools).length > 0) {
+        return rejectCompletion(
+          `Task #${taskId} still has active tool work. Let it settle, verify the result, and retry completion.`
+        );
+      }
+
+      const binding = await resolveBinding(ctx, false);
+      if (!binding) {
+        return rejectCompletion(
+          `Advisor could not verify task #${taskId}. Keep it in progress and continue from the task's acceptance criteria until verification is available.`
+        );
+      }
+      const startInputEpoch = inputEpoch;
+      try {
+        const decision = await analyze(
+          ctx,
+          binding,
+          manager.get(),
+          'completion',
+          `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${task.subject ?? ''}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
+          await resolveHostContext(ctx)
+        );
+        if (startInputEpoch !== inputEpoch) {
+          return rejectCompletion(
+            `New user input arrived while task #${taskId} was being checked. Keep it active and reconcile the new instruction before retrying completion.`
+          );
+        }
+        if (decision.verdict === 'PASS' && decision.confidence >= 0.7) return undefined;
+        const reason = decision.message?.trim() || decision.reasoning.trim();
+        return rejectCompletion(
+          `Task #${taskId} is not yet verified complete${reason ? `: ${reason}` : '.'} Keep working, then retry TaskUpdate.`
+        );
+      } catch (error) {
+        return rejectCompletion(
+          `Advisor could not verify task #${taskId}: ${error instanceof Error ? error.message : String(error)}. Keep it in progress, continue the work, and retry completion.`
+        );
+      }
+    };
+
     pi.events.on(TASK_STATE_EVENT, (value: unknown) => {
+      const completedTasks = completedTaskTransitions(manager.get().taskState, value);
       const reason =
         value && typeof value === 'object' && 'reason' in value
           ? String((value as any).reason)
           : undefined;
       manager.setTaskState(value, reason);
+      const source =
+        value && typeof value === 'object' && 'source' in value
+          ? String((value as any).source)
+          : undefined;
+      for (const task of source === 'tool' ? [] : completedTasks) {
+        manager.queueSemanticMatches([
+          {
+            ruleId: 'task.completion-reconciliation',
+            message: `Task ${task.id} reports done; reconcile the claim against its acceptance criteria and runtime evidence.`,
+            severity: 'concern',
+            effect: 'semantic',
+            activates: true,
+            interruptMode: 'never',
+            source: 'task',
+            signature: digest(`task-completion\u0000${task.id}\u0000${task.updatedAt}`),
+            filePaths: [],
+            provenance: { owner: 'pi-advisor', source: 'pi-tasks:state' },
+          },
+        ]);
+      }
       substantial = true;
       manager.persist();
       void watch({ source: 'task', content: JSON.stringify(value), snapshot: true });
@@ -229,7 +234,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       pendingReminders = [];
       pendingInputs.clear();
       automaticRouteFailure = undefined;
-      mutationIntentCache = undefined;
       substantial = substantialState(manager.get());
     });
 
@@ -242,7 +246,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       pendingReminders = [];
       pendingInputs.clear();
       automaticRouteFailure = undefined;
-      mutationIntentCache = undefined;
       substantial = substantialState(manager.get());
     });
 
@@ -250,7 +253,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (event.source !== 'interactive' && event.source !== 'rpc') return;
       inputEpoch++;
       manager.bindTrustedInput(event.text, event.source);
-      mutationIntentCache = undefined;
       manager.persist();
       if (!automaticCheckActive || event.streamingBehavior) return;
 
@@ -379,10 +381,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
 
     pi.on('tool_call', async (event: ToolCallEvent, ctx) => {
-      const blocked = gateTaskCall(event, manager);
-      if (blocked?.block) return blocked;
-      const mutationBlocked = await mutationGate(event, ctx);
-      if (mutationBlocked) return mutationBlocked;
+      const completionBlocked = await completionGate(event, ctx);
+      if (completionBlocked) return completionBlocked;
       const input = structuredClone(event.input as Record<string, unknown>);
       pendingInputs.set(event.toolCallId, { name: event.toolName, input });
       manager.toolStarted(event.toolCallId, event.toolName, input);
@@ -458,7 +458,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (!substantial || !manager.get().objective) return;
       if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
       const task = activeTask(manager.get().taskState);
-      if (task?.task?.status === 'done' || task?.task?.status === 'cancelled') return;
       await watch({
         source: 'lifecycle',
         content: `agent_settled substantial:${substantial} task:${task ? 'active' : 'none'} validation:${manager.get().validationAt ? 'present' : 'missing'} mutations:${manager.get().touchedFiles.length}`,
@@ -478,8 +477,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         manager.clearSemanticMatches();
         manager.queueSemanticMatches(semanticMatches);
       }
-      const completionRequested = manager.get().completionRequested;
-      if (!semanticMatches.length && !completionRequested) {
+      if (!semanticMatches.length) {
         manager.persist();
         return;
       }
@@ -488,12 +486,10 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         const binding = await resolveBinding(ctx, false);
         if (!binding) {
           const message =
-            task || completionRequested
-              ? 'Advisor could not run the required different-family completion check; the task remains active.'
-              : 'Advisor could not run the different-family semantic check; the deterministic warning remains unresolved.';
+            'Advisor could not run the different-family semantic check; operations continue and the deterministic warning remains visible.';
           if (automaticRouteFailure !== message) {
             automaticRouteFailure = message;
-            emit(message, task || completionRequested ? 'blocker' : 'concern', ctx);
+            emit(message, 'concern', ctx);
           }
           return;
         }
@@ -513,16 +509,14 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
                       `- ${match.ruleId}: ${match.message}${match.provenance?.source ? ` [source: ${match.provenance.source}]` : ''}`
                   )
                   .join('\n')}`
-              : completionRequested
-                ? `Completion requested for ${completionRequested.taskId}.`
-                : undefined,
+              : undefined,
             await resolveHostContext(ctx)
           );
         } catch (error) {
           if (startInputEpoch === inputEpoch && startActivityEpoch === activityEpoch)
             emit(
               `Advisor check failed: ${error instanceof Error ? error.message : String(error)}`,
-              completionRequested ? 'blocker' : 'concern',
+              'concern',
               ctx
             );
           return;
@@ -535,32 +529,20 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           return;
         manager.clearSemanticMatches();
         manager.markAnalyzed();
-        handleDecision(decision, ctx, task?.id);
+        handleDecision(decision, ctx);
         manager.persist();
       } finally {
         automaticCheckActive = false;
       }
     });
 
-    const handleDecision = (
-      decision: AdvisorDecision,
-      ctx: ExtensionContext,
-      taskId?: string
-    ): void => {
+    const handleDecision = (decision: AdvisorDecision, ctx: ExtensionContext): void => {
       if (decision.objectiveInputAt !== undefined) {
         manager.applyObjectiveInput(decision.objectiveInputAt);
       }
       const message = decision.message?.trim();
       if (decision.verdict === 'PASS') {
-        const completionRequest = manager.get().completionRequested;
-        if (taskId && completionRequest?.taskId === taskId) {
-          const permit = manager.issuePermit(taskId);
-          const continuation = `Completion evidence reconciled. Submit the existing task completion once with its supported evidence. Permit ${permit.slice(0, 12)}.`;
-          if (!ctx.hasPendingMessages() && manager.markContinuation(`complete:${permit}`))
-            emit(continuation, 'nit', ctx, true);
-        } else if (message) {
-          emit(message, 'nit', ctx);
-        }
+        if (message) emit(message, 'nit', ctx);
         return;
       }
       if (!message || decision.action === 'silent') return;
@@ -587,7 +569,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     pi.on('model_select', () => {
       routeLabel = undefined;
       automaticRouteFailure = undefined;
-      mutationIntentCache = undefined;
       disposeAdvisorSession();
     });
     pi.on('session_shutdown', () => {
@@ -612,7 +593,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
               'UNKNOWN',
               'No eligible different-family Advisor route is available.'
             ),
-            'blocker',
+            'concern',
             ctx
           );
           return;
@@ -630,7 +611,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         } catch (error) {
           emit(
             `Advisor question failed: ${error instanceof Error ? error.message : String(error)}`,
-            'blocker',
+            'concern',
             ctx
           );
           return;
@@ -772,6 +753,66 @@ function extractPaths(input: Record<string, unknown>): string[] {
   ];
 }
 
+function completedTaskTransitions(
+  previous: unknown,
+  current: unknown
+): Array<{ id: string; updatedAt: string }> {
+  const before = taskRecords(previous);
+  if (!before) return [];
+  const after = taskRecords(current);
+  if (!after) return [];
+  const completed: Array<{ id: string; updatedAt: string }> = [];
+  for (const [id, value] of Object.entries(after)) {
+    if (!value || typeof value !== 'object') continue;
+    const task = value as { status?: unknown; updatedAt?: unknown };
+    const prior = before[id] as { status?: unknown } | undefined;
+    const isCompleted = task.status === 'done' || task.status === 'completed';
+    const priorCompleted = prior?.status === 'done' || prior?.status === 'completed';
+    if (!isCompleted || priorCompleted) continue;
+    completed.push({
+      id,
+      updatedAt: typeof task.updatedAt === 'string' ? task.updatedAt : String(Date.now()),
+    });
+  }
+  return completed;
+}
+
+function taskRecords(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const event = value as { state?: unknown; tasks?: unknown };
+  const state = event.state ?? event;
+  if (!state || typeof state !== 'object') return undefined;
+  const tasks = (state as { tasks?: unknown }).tasks;
+  if (Array.isArray(tasks)) {
+    return Object.fromEntries(
+      tasks
+        .filter((task): task is Record<string, unknown> => !!task && typeof task === 'object')
+        .filter((task) => typeof task.id === 'string')
+        .map((task) => [String(task.id), task])
+    );
+  }
+  return tasks && typeof tasks === 'object' ? (tasks as Record<string, unknown>) : undefined;
+}
+
+function taskById(value: unknown, id: string): Record<string, any> | undefined {
+  const task = taskRecords(value)?.[id];
+  return task && typeof task === 'object' ? (task as Record<string, any>) : undefined;
+}
+
+function openTaskBlockers(value: unknown, task: Record<string, any>): string[] {
+  const records = taskRecords(value) ?? {};
+  const blockedBy = Array.isArray(task.blockedBy) ? task.blockedBy : [];
+  return blockedBy.filter((id): id is string => {
+    if (typeof id !== 'string') return false;
+    const blocker = records[id] as { status?: unknown } | undefined;
+    return !blocker || (blocker.status !== 'completed' && blocker.status !== 'done');
+  });
+}
+
+function rejectCompletion(reason: string): ToolCallEventResult {
+  return { block: true, reason };
+}
+
 function evidenceInput(input: Record<string, unknown>): Record<string, unknown> {
   return Object.fromEntries(
     ['path', 'file', 'filePath', 'file_path', 'target', 'task_id', 'step_id', 'type']
@@ -779,7 +820,6 @@ function evidenceInput(input: Record<string, unknown>): Record<string, unknown> 
       .map((key) => [key, input[key]])
   );
 }
-
 function looksLikeValidation(toolName: string, input: Record<string, unknown>): boolean {
   const command = typeof input.command === 'string' ? input.command : '';
   return /(?:test|check|lint|typecheck|verify|diagnostic|build)/i.test(`${toolName} ${command}`);

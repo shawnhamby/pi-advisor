@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AdvisorState, PlanBinding, ToolEvidence } from '../types.js';
 import type { WatchEngineState, WatchMatch } from '../watch/types.js';
@@ -47,8 +46,6 @@ export class AdvisorStateManager {
     const effectiveAt = Math.max(at, priorAt + 1);
     this.state.lastTrustedInput = { text: trimmed, source, at: effectiveAt };
     this.state.trustedInputs.push({ text: trimmed, source, at: effectiveAt });
-    this.state.completionPermit = undefined;
-    this.state.completionRequested = undefined;
     this.state.continuationIssuedFor = undefined;
     this.state.pendingSemanticMatches = [];
     if (this.state.trustedInputs.length > MAX_TRUSTED_INPUTS) {
@@ -65,33 +62,22 @@ export class AdvisorStateManager {
     if (!input) return false;
     this.state.objective = input.text;
     this.state.objectiveUpdatedAt = input.at;
-    this.state.completionPermit = undefined;
     this.state.continuationIssuedFor = undefined;
     this.persist();
     return true;
   }
 
   setPlan(plan: PlanBinding | undefined): void {
-    if (JSON.stringify(this.state.plan) !== JSON.stringify(plan)) {
-      this.state.completionPermit = undefined;
-      this.state.completionRequested = undefined;
-    }
     this.state.plan = plan;
   }
 
   setInstructions(instructions: AdvisorState['instructions']): void {
-    if (JSON.stringify(this.state.instructions) !== JSON.stringify(instructions)) {
-      this.state.completionPermit = undefined;
-      this.state.completionRequested = undefined;
-    }
     this.state.instructions = instructions;
   }
 
   setTaskState(value: unknown, reason?: string): void {
     this.state.taskState = structuredClone(value);
     this.state.taskReason = reason;
-    this.state.completionPermit = undefined;
-    this.state.completionRequested = undefined;
   }
 
   setWatchState(value: WatchEngineState): void {
@@ -118,24 +104,10 @@ export class AdvisorStateManager {
     this.state.pendingSemanticMatches = [];
   }
 
-  markCompletionRequested(taskId: string): void {
-    this.state.completionRequested = { taskId, at: Date.now() };
-    this.state.completionPermit = undefined;
-    this.persist();
-  }
-
-  clearCompletionRequest(): void {
-    this.state.completionRequested = undefined;
-  }
-
   toolStarted(id: string, name: string, input: Record<string, unknown>): void {
     this.state.activeTools[id] = { name, startedAt: Date.now() };
     if (isMutationTool(name)) {
       for (const file of extractPaths(input)) this.addTouchedFile(file);
-    }
-    if (isMutationTool(name) || isShellTool(name)) {
-      this.state.completionPermit = undefined;
-      this.state.completionRequested = undefined;
     }
   }
 
@@ -165,23 +137,6 @@ export class AdvisorStateManager {
 
   markAnalyzed(): void {
     this.state.lastAnalysisAt = Date.now();
-  }
-
-  issuePermit(taskId: string): string {
-    const digest = stateDigest(this.state, taskId);
-    this.state.completionPermit = { digest, taskId, createdAt: Date.now() };
-    this.state.completionRequested = undefined;
-    this.persist();
-    return digest;
-  }
-
-  consumePermit(taskId: string): boolean {
-    const permit = this.state.completionPermit;
-    if (!permit || permit.taskId !== taskId || permit.digest !== stateDigest(this.state, taskId))
-      return false;
-    this.state.completionPermit = undefined;
-    this.persist();
-    return true;
   }
 
   emissionAllowed(signature: string, minimumIntervalMs = 30_000): boolean {
@@ -226,41 +181,17 @@ export class AdvisorStateManager {
   }
 }
 
-function stateDigest(state: AdvisorState, taskId: string): string {
-  return createHash('sha256')
-    .update(
-      JSON.stringify({
-        objective: state.objective,
-        plan: state.plan,
-        taskId,
-        task: activeTask(state.taskState),
-        touchedFiles: state.touchedFiles,
-        validationAt: state.validationAt,
-        blockers: state.blockers,
-        lastTrustedInput: state.lastTrustedInput,
-        evidence: state.toolEvidence
-          .filter(
-            (item) =>
-              item.isError ||
-              isValidationTool(item) ||
-              isMutationTool(item.toolName) ||
-              isShellTool(item.toolName)
-          )
-          .map(({ toolCallId, outputDigest, isError }) => ({
-            toolCallId,
-            outputDigest,
-            isError,
-          })),
-      })
-    )
-    .digest('hex');
-}
-
 export function activeTask(value: unknown): { id: string; task: any } | undefined {
   if (!value || typeof value !== 'object') return undefined;
-  const state = (value as any).state;
+  const event = value as any;
+  const state = event.state ?? event;
   const id = state?.activeTaskId;
-  const task = id ? state?.tasks?.[id] : undefined;
+  const tasks = state?.tasks;
+  const task = id
+    ? Array.isArray(tasks)
+      ? tasks.find((candidate: any) => candidate?.id === id)
+      : tasks?.[id]
+    : undefined;
   return task ? { id, task } : undefined;
 }
 
@@ -293,8 +224,4 @@ function isValidationTool(evidence: ToolEvidence): boolean {
 
 function isMutationTool(name: string): boolean {
   return /(?:edit|write|patch|delete|create|rename|move)/i.test(name);
-}
-
-function isShellTool(name: string): boolean {
-  return /^(?:bash|shell|exec|exec_command)$/i.test(name);
 }
