@@ -61,6 +61,11 @@ export type AdvisorState = {
   pendingContinuity?: boolean;
   watch?: WatchEngineState;
   pendingSemanticMatches?: WatchMatch[];
+  completionReconciliation?: {
+    taskId: string;
+    reason: string;
+    nudged: boolean;
+  };
 };
 
 export type AdvisorDecision = {
@@ -72,9 +77,16 @@ export type AdvisorDecision = {
   objectiveInputAt?: number;
 };
 
+export type AdvisorAnalysisMode = 'automatic' | 'completion' | 'question';
+
 export type AdvisorHostOptions = {
   resolveModel(ctx: ExtensionContext): Promise<AdvisorModelBinding | undefined>;
-  resolveContext?(ctx: ExtensionContext, state: AdvisorState): Promise<string>;
+  resolveContext?(
+    ctx: ExtensionContext,
+    state: AdvisorState,
+    mode: AdvisorAnalysisMode,
+    semanticEscalation: boolean
+  ): Promise<string>;
   watchContract?: WatchContract;
   matchAst?: AstMatcher;
   resolveToolSnapshots?(

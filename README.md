@@ -6,26 +6,35 @@ This is a narrow fork of `@monotykamary/pi-supervisor` that keeps its useful
 algorithmic conversation compaction and isolated-model session, while changing
 the authority model:
 
-- supervision is always loaded and activates from real work signals;
+- supervision is always loaded and incrementally shadows every primary turn in
+  a nonblocking, coalescing background lane;
 - interactive and RPC input are the only trusted user-input sources;
 - `pi-tasks` state and actual tool results back completion decisions;
 - agent-requested task completion is checked before `TaskUpdate` can mark it complete;
 - an unsupported completion attempt returns one corrective tool error without terminating or pausing the agent;
+- completion checks judge prerequisites at the tool's transition boundary rather than requiring effects that can occur only after the transition;
+- a rejected completion is reconciled once at the next settled boundary so an active task cannot be silently abandoned;
 - direct user completion through `/tasks` remains user-authoritative and is reconciled after the transition;
-- messages are agent-attributed Pi custom messages, never user impersonation;
+- messages are tagged Pi custom messages and never replay trusted user input;
 - an OMP-derived deterministic watch lane observes bounded text, thinking,
   tool, result, task, and lifecycle streams without calling a model;
 - host-supplied regex and AST rules can remind at a safe boundary or schedule
   one semantic check, but cannot block tools or grant authority;
 - native Pi remains the compaction owner, with a single continuity reminder
   after compaction;
+- the isolated Advisor gets only bounded read, grep, and find tools rooted at
+  the active workspace, and receives sanitized transcript deltas rather than a
+  fresh full transcript on every update;
+- each reset private session receives host-verified instruction and skill
+  context once, then receives it again only for semantic escalation,
+  completion, or a direct `/advisor` question;
 - the only command is `/advisor`, optionally followed by a natural-language
   question or explicit correction.
 
-When the user submits input during an automatic settled check, Advisor cancels
-the stale check and hands that input back to Pi's normal steering lane exactly
-once. Advisor model-routing failures are reported once per unchanged failure
-instead of repeating after every settled turn.
+When the user submits input during a background check, Advisor invalidates the
+stale result and leaves Pi's native steering and follow-up queues untouched.
+Advisor model-routing failures remain silent in the background and are reported
+once per unchanged failure at an explicit completion or `/advisor` boundary.
 
 ## Host integration
 
@@ -45,6 +54,9 @@ export default createAdvisorExtension({
       effort: 'medium',
       family: 'different-family',
     };
+  },
+  async resolveContext(ctx, state, mode, semanticEscalation) {
+    return hostPolicyContext({ ctx, state, mode, semanticEscalation });
   },
   watchContract,
   matchAst: workspaceAstMatcher,
@@ -86,4 +98,11 @@ commit `08819b279cf02ae2545e69dad7111ab48d91d35e`. It retains bounded
 source-aware buffers, regex/AST predicates, path/tool scoping, repeat policy,
 and persisted violation-signature deduplication while omitting OMP rule
 discovery, opinion packs, interrupt/retry ownership, memory, todos, and
-model-on-every-turn behavior.
+workflow ownership. The incremental background queue, emission discipline, and
+quiet-review prompt were re-evaluated against Oh My Pi at commit
+`45e12e5bb758198a920c6070e7e64cb33b21beac`; this fork keeps its stricter trusted-input,
+task-completion, and host-policy boundaries.
+
+Pi currently serializes custom messages through a provider-side user-shaped
+context role. The `<advisor>` tag and message metadata preserve semantic
+provenance inside Pi, but they do not claim a distinct wire-level agent role.

@@ -5,11 +5,16 @@
 
 import {
   createAgentSession,
+  createFindTool,
+  createGrepTool,
+  createReadTool,
   DefaultResourceLoader,
   getAgentDir,
   SessionManager,
 } from '@earendil-works/pi-coding-agent';
 import type { CreateAgentSessionOptions, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { realpath } from 'node:fs/promises';
+import { resolve, sep } from 'node:path';
 
 export class SupervisorSession {
   private session: Awaited<ReturnType<typeof createAgentSession>>['session'] | null = null;
@@ -48,11 +53,13 @@ export class SupervisorSession {
 
     try {
       const result = await createAgentSession({
+        cwd: ctx.cwd,
         sessionManager: SessionManager.inMemory(),
         agentDir: getAgentDir(),
         model: newModel,
         thinkingLevel: effort as NonNullable<CreateAgentSessionOptions['thinkingLevel']>,
-        tools: [],
+        tools: ['read', 'grep', 'find'],
+        customTools: advisorTools(ctx.cwd),
         resourceLoader: loader,
       });
       this.session = result.session;
@@ -101,4 +108,40 @@ export class SupervisorSession {
     }
     this.model = null;
   }
+}
+
+function advisorTools(cwd: string) {
+  return [createReadTool(cwd), createGrepTool(cwd), createFindTool(cwd)].map((tool) =>
+    constrainToRoot(tool, cwd)
+  );
+}
+
+function constrainToRoot<T extends { execute: (...args: any[]) => Promise<any> }>(
+  tool: T,
+  cwd: string
+): T {
+  const execute = tool.execute.bind(tool);
+  tool.execute = (async (...args: Parameters<T['execute']>) => {
+    const input = args[1] as { path?: unknown } | undefined;
+    await assertWithinRoot(cwd, typeof input?.path === 'string' ? input.path : '.');
+    return execute(...args);
+  }) as T['execute'];
+  return tool;
+}
+
+async function assertWithinRoot(cwd: string, requestedPath: string): Promise<void> {
+  const lexicalRoot = resolve(cwd);
+  const root = await realpath(cwd);
+  const candidate = resolve(lexicalRoot, requestedPath);
+  if (!within(candidate, lexicalRoot) && !within(candidate, root)) {
+    throw new Error('Advisor read-only tools are restricted to the active workspace');
+  }
+  const actual = await realpath(candidate);
+  if (!within(actual, root)) {
+    throw new Error('Advisor read-only tools cannot follow paths outside the active workspace');
+  }
+}
+
+function within(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(`${root}${sep}`);
 }

@@ -8,15 +8,28 @@
   deduplication, and semantic-trigger escalation.
 - Keep reminders separate from tool results so evidence digests and compaction
   provenance remain exact.
-- Run automatic model checks only for semantic watch signals; `/advisor`
-  remains an on-demand direct check.
+- Process every primary turn through one coalescing, incremental background lane;
+  `/advisor` remains an on-demand bounded foreground check.
 - Check an agent's `TaskUpdate status=completed` request before it mutates task
   state. A failed check returns a corrective tool error without terminating the
   agent; user-driven `/tasks` transitions remain authoritative.
 - Never block execution tools, mutate task state, or issue completion permits.
-- Preserve user input that arrives during an automatic settled check by
-  cancelling the stale check and resubmitting through Pi's steering lane.
+- Invalidate stale background advice when trusted input arrives without
+  intercepting, replaying, or impersonating that input.
+- Add normalized filler suppression, per-update deduplication, and severity
+  escalation so productive work is quiet and repeated notes do not churn.
+- Give the isolated Advisor only bounded read, grep, and find tools rooted at
+  the active workspace, with sanitized incremental transcript deltas.
+- Prime each reset Advisor generation once with mode-aware, host-verified
+  instruction and skill context; refresh it only for semantic escalation,
+  completion, or direct questions.
 - Deduplicate unchanged automatic model-routing failures.
+- Preserve both the beginning and end of long tool results so terminal handoffs
+  remain visible to completion checks.
+- Judge completion against prerequisites available at the tool transition
+  boundary rather than later-phase effects.
+- Reconcile a rejected completion once when the agent settles so an active task
+  cannot be silently abandoned.
 
 ## 0.1.0
 

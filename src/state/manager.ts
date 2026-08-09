@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { AdvisorState, PlanBinding, ToolEvidence } from '../types.js';
 import type { WatchEngineState, WatchMatch } from '../watch/types.js';
+import { normalizeAdvisorNote } from '../core/emission-guard.js';
 
 const ADVISOR_STATE_ENTRY = 'pi-advisor-state';
 const MAX_TOOL_EVIDENCE = 40;
@@ -47,6 +48,7 @@ export class AdvisorStateManager {
     this.state.lastTrustedInput = { text: trimmed, source, at: effectiveAt };
     this.state.trustedInputs.push({ text: trimmed, source, at: effectiveAt });
     this.state.continuationIssuedFor = undefined;
+    this.state.completionReconciliation = undefined;
     this.state.pendingSemanticMatches = [];
     if (this.state.trustedInputs.length > MAX_TRUSTED_INPUTS) {
       this.state.trustedInputs.splice(0, this.state.trustedInputs.length - MAX_TRUSTED_INPUTS);
@@ -78,6 +80,35 @@ export class AdvisorStateManager {
   setTaskState(value: unknown, reason?: string): void {
     this.state.taskState = structuredClone(value);
     this.state.taskReason = reason;
+    const task = activeTask(value);
+    if (!task || task.id !== this.state.completionReconciliation?.taskId) {
+      this.state.completionReconciliation = undefined;
+    }
+  }
+
+  setCompletionReconciliation(taskId: string, reason: string): void {
+    const prior = this.state.completionReconciliation;
+    const trimmed = reason.trim();
+    const sameReason =
+      prior?.taskId === taskId &&
+      normalizeAdvisorNote(prior.reason) === normalizeAdvisorNote(trimmed);
+    this.state.completionReconciliation = {
+      taskId,
+      reason: trimmed,
+      nudged: sameReason ? prior.nudged : false,
+    };
+  }
+
+  markCompletionReconciliationNudged(taskId: string): boolean {
+    const reconciliation = this.state.completionReconciliation;
+    if (reconciliation?.taskId !== taskId || reconciliation.nudged) return false;
+    reconciliation.nudged = true;
+    return true;
+  }
+
+  clearCompletionReconciliation(taskId: string): void {
+    if (this.state.completionReconciliation?.taskId !== taskId) return;
+    this.state.completionReconciliation = undefined;
   }
 
   setWatchState(value: WatchEngineState): void {

@@ -12,9 +12,17 @@ import type {
 } from '@earendil-works/pi-coding-agent';
 import { Container, Text } from '@earendil-works/pi-tui';
 import { analyze } from './core/analyzer.js';
+import { IncrementalAdvisorQueue } from './core/background-queue.js';
+import {
+  redactCrossProviderSecrets,
+  sanitizeCrossProvider,
+} from './core/cross-provider-sanitizer.js';
+import { AdvisorEmissionGuard } from './core/emission-guard.js';
+import { TranscriptDeltaRecorder } from './core/transcript-delta.js';
 import { disposeAdvisorSession } from './session/client.js';
 import { activeTask, AdvisorStateManager } from './state/manager.js';
 import type {
+  AdvisorAnalysisMode,
   AdvisorDecision,
   AdvisorHostOptions,
   AdvisorModelBinding,
@@ -29,25 +37,37 @@ import type { WatchInput, WatchMatch } from './watch/types.js';
 const TASK_STATE_EVENT = 'pi-tasks:state';
 const ADVISOR_MESSAGE = 'pi-advisor';
 const CONTINUITY_EVENT = 'pi-advisor:continuity-restored';
+const EVIDENCE_PREVIEW_LIMIT = 720;
+const EVIDENCE_PREVIEW_HEAD = 200;
+const ADVISOR_CATCHUP_MS = 30_000;
 const HIGH_SIGNAL_TOOLS =
   /^(?:bash|exec|edit|write|TaskCreate|TaskUpdate|task_plan|task_update|task_evidence|task_complete|spawn_agent|create_thread)$/i;
 const MUTATION_TOOLS = /^(?:edit|write|patch|apply_patch|delete|rename|move|readSeek_rename)$/i;
+
+type BackgroundUpdate = {
+  ctx: ExtensionContext;
+  transcript: string;
+  wip: boolean;
+  inputEpoch: number;
+  semanticMatches: WatchMatch[];
+};
 
 export function createAdvisorExtension(options: AdvisorHostOptions) {
   return function advisorExtension(pi: ExtensionAPI): void {
     const manager = new AdvisorStateManager(pi);
     const pendingInputs = new Map<string, { name: string; input: Record<string, unknown> }>();
     let inputEpoch = 0;
-    let activityEpoch = 0;
     let substantial = false;
     let routeLabel: string | undefined;
-    let automaticCheckActive = false;
     let automaticRouteFailure: string | undefined;
     let watcher = options.watchContract
       ? new WatchEngine(options.watchContract, options.matchAst)
       : undefined;
     let watchQueue = Promise.resolve<WatchMatch[]>([]);
-    let pendingReminders: WatchMatch[] = [];
+    const pendingReminders = new Map<string, WatchMatch[]>();
+    const transcript = new TranscriptDeltaRecorder();
+    const emissionGuard = new AdvisorEmissionGuard();
+    let needsHostPrimeGeneration = -1;
 
     const watch = (input: WatchInput): Promise<WatchMatch[]> => {
       const activeWatcher = watcher;
@@ -64,9 +84,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
             ...match,
             observedEvidenceCount: manager.get().toolEvidence.length,
           }));
-        const reminders = matches.filter((match) => match.effect === 'remind');
         if (semantic.length) manager.queueSemanticMatches(semantic);
-        if (reminders.length) pendingReminders.push(...reminders);
         manager.setWatchState(watcher!.exportState());
         manager.persist();
         if (matches.some((match) => match.activates)) substantial = true;
@@ -79,11 +97,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       severity: AdvisorSeverity,
       ctx: ExtensionContext,
       continuation = false
-    ): void => {
+    ): boolean => {
       const trimmed = message.trim();
-      if (!trimmed) return;
+      if (!trimmed) return false;
       const signature = digest(`${severity}\u0000${trimmed}`);
-      if (!manager.emissionAllowed(signature)) return;
+      if (!manager.emissionAllowed(signature)) return false;
       const details = {
         notes: [{ note: trimmed, severity }],
         route: routeLabel,
@@ -101,6 +119,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           ? { deliverAs: 'followUp', triggerTurn: true }
           : { deliverAs: 'steer', triggerTurn: false }
       );
+      return true;
     };
 
     const resolveBinding = async (
@@ -133,6 +152,74 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       manager.persist();
     };
 
+    const background = new IncrementalAdvisorQueue<BackgroundUpdate>(
+      async ({ items, generation }) => {
+        const latest = items.at(-1);
+        if (!latest || !background.isCurrent(generation)) return;
+        const binding = await resolveBinding(latest.ctx, false);
+        if (!binding || !background.isCurrent(generation)) return;
+        const semanticMatches = uniqueMatches(items.flatMap((item) => item.semanticMatches));
+        const semanticEscalation = semanticMatches.length > 0;
+        const needsHostPrime = needsHostPrimeGeneration === generation;
+        const hostContext =
+          needsHostPrime || semanticEscalation
+            ? await resolveHostContext(latest.ctx, 'automatic', semanticEscalation)
+            : undefined;
+        if (!background.isCurrent(generation)) return;
+        const decision = await analyze(
+          latest.ctx,
+          binding,
+          structuredClone(manager.get()),
+          'automatic',
+          semanticMatches.length ? semanticPrompt(semanticMatches) : undefined,
+          hostContext,
+          undefined,
+          coalescedTranscript(items)
+        );
+        if (!background.isCurrent(generation) || latest.inputEpoch !== inputEpoch) return;
+        if (needsHostPrimeGeneration === generation) needsHostPrimeGeneration = -1;
+        manager.markAnalyzed();
+        handleBackgroundDecision(
+          { decision, inputEpoch: latest.inputEpoch, wip: latest.wip },
+          latest.ctx
+        );
+        manager.persist();
+      }
+    );
+
+    const resetBackground = (ctx: ExtensionContext): void => {
+      needsHostPrimeGeneration = background.reset();
+      transcript.reset();
+      emissionGuard.reset();
+      disposeAdvisorSession();
+      const prime = transcript.prime(ctx);
+      if (prime && manager.get().objective) {
+        background.enqueue({
+          ctx,
+          transcript: `[initial bounded prime]\n${prime}`,
+          wip: false,
+          inputEpoch,
+          semanticMatches: [],
+        });
+      }
+    };
+
+    const queuePrimaryDelta = (
+      ctx: ExtensionContext,
+      wip: boolean,
+      semanticMatches: WatchMatch[] = []
+    ): void => {
+      const delta = transcript.take(ctx);
+      if (!delta && !semanticMatches.length) return;
+      background.enqueue({
+        ctx,
+        transcript: delta ?? '[no additional transcript; semantic escalation only]',
+        wip,
+        inputEpoch,
+        semanticMatches,
+      });
+    };
+
     const completionGate = async (
       event: ToolCallEvent,
       ctx: ExtensionContext
@@ -140,54 +227,68 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (event.toolName !== 'TaskUpdate') return undefined;
       const input = event.input as Record<string, unknown>;
       if (input.status !== 'completed') return undefined;
+      substantial = true;
 
       const taskId = typeof input.taskId === 'string' ? input.taskId : '';
+      const reject = (reason: string): ToolCallEventResult => {
+        manager.setCompletionReconciliation(taskId, reason);
+        manager.persist();
+        return rejectCompletion(reason);
+      };
       const task = taskById(manager.get().taskState, taskId);
       if (!task) {
-        return rejectCompletion(
+        return reject(
           `Task #${taskId || '?'} is not present in the current task state. Keep it active, refresh the task list, and retry completion.`
         );
       }
       const blockers = openTaskBlockers(manager.get().taskState, task);
       if (blockers.length) {
-        return rejectCompletion(
+        return reject(
           `Task #${taskId} is still blocked by ${blockers.map((id) => `#${id}`).join(', ')}. Resolve those tasks before retrying completion.`
         );
       }
       if (Object.keys(manager.get().activeTools).length > 0) {
-        return rejectCompletion(
+        return reject(
           `Task #${taskId} still has active tool work. Let it settle, verify the result, and retry completion.`
         );
       }
 
-      const binding = await resolveBinding(ctx, false);
-      if (!binding) {
-        return rejectCompletion(
-          `Advisor could not verify task #${taskId}. Keep it in progress and continue from the task's acceptance criteria until verification is available.`
-        );
-      }
       const startInputEpoch = inputEpoch;
       try {
-        const decision = await analyze(
-          ctx,
-          binding,
-          manager.get(),
-          'completion',
-          `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${task.subject ?? ''}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
-          await resolveHostContext(ctx)
+        const decision = await background.runForeground(
+          async () => {
+            const binding = await resolveBinding(ctx, false);
+            if (!binding)
+              throw new Error('no eligible different-family Advisor route is available');
+            return analyze(
+              ctx,
+              binding,
+              structuredClone(manager.get()),
+              'completion',
+              `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${task.subject ?? ''}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
+              await resolveHostContext(ctx, 'completion', false),
+              ctx.signal
+            );
+          },
+          ADVISOR_CATCHUP_MS,
+          ctx.signal
         );
         if (startInputEpoch !== inputEpoch) {
-          return rejectCompletion(
+          return reject(
             `New user input arrived while task #${taskId} was being checked. Keep it active and reconcile the new instruction before retrying completion.`
           );
         }
-        if (decision.verdict === 'PASS' && decision.confidence >= 0.7) return undefined;
+        if (decision.verdict === 'PASS' && decision.confidence >= 0.7) {
+          manager.clearCompletionReconciliation(taskId);
+          manager.persist();
+          return undefined;
+        }
         const reason = decision.message?.trim() || decision.reasoning.trim();
-        return rejectCompletion(
+        return reject(
           `Task #${taskId} is not yet verified complete${reason ? `: ${reason}` : '.'} Keep working, then retry TaskUpdate.`
         );
       } catch (error) {
-        return rejectCompletion(
+        return reject(
           `Advisor could not verify task #${taskId}: ${error instanceof Error ? error.message : String(error)}. Keep it in progress, continue the work, and retry completion.`
         );
       }
@@ -231,10 +332,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
         : undefined;
       watchQueue = Promise.resolve([]);
-      pendingReminders = [];
+      pendingReminders.clear();
       pendingInputs.clear();
       automaticRouteFailure = undefined;
       substantial = substantialState(manager.get());
+      resetBackground(ctx);
     });
 
     pi.on('session_tree', (_event, ctx) => {
@@ -243,10 +345,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
         : undefined;
       watchQueue = Promise.resolve([]);
-      pendingReminders = [];
+      pendingReminders.clear();
       pendingInputs.clear();
       automaticRouteFailure = undefined;
       substantial = substantialState(manager.get());
+      resetBackground(ctx);
     });
 
     pi.on('input', (event) => {
@@ -254,19 +357,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       inputEpoch++;
       manager.bindTrustedInput(event.text, event.source);
       manager.persist();
-      if (!automaticCheckActive || event.streamingBehavior) return;
-
-      // Pi marks the main session idle while awaiting agent_settled handlers. If the
-      // user submits during that window, an Advisor continuation can otherwise start
-      // between input preflight and dispatch, causing Pi to reject the user message.
-      // Cancel the stale check and resubmit once with an explicit lane so the message
-      // is valid whether the main session is still idle or has just resumed.
-      disposeAdvisorSession();
-      const content = event.images?.length
-        ? [{ type: 'text' as const, text: event.text }, ...event.images]
-        : event.text;
-      pi.sendUserMessage(content, { deliverAs: 'steer' });
-      return { action: 'handled' as const };
     });
 
     pi.on('before_agent_start', async (event, ctx) => {
@@ -365,7 +455,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         });
     });
 
-    pi.on('turn_end', (event) => {
+    pi.on('turn_end', (event, ctx) => {
       const turnWatcher = watcher;
       void watch({
         source: 'lifecycle',
@@ -378,6 +468,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           manager.persist();
         }
       });
+      queuePrimaryDelta(ctx, turnIsInProgress(event.message));
     });
 
     pi.on('tool_call', async (event: ToolCallEvent, ctx) => {
@@ -387,7 +478,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       pendingInputs.set(event.toolCallId, { name: event.toolName, input });
       manager.toolStarted(event.toolCallId, event.toolName, input);
       if (HIGH_SIGNAL_TOOLS.test(event.toolName)) substantial = true;
-      activityEpoch++;
       void watch({
         source: 'tool',
         toolName: event.toolName,
@@ -395,6 +485,9 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         streamKey: `tool:${event.toolCallId}`,
         filePaths: extractPaths(input),
         snapshot: true,
+      }).then((matches) => {
+        const reminders = matches.filter((match) => match.effect === 'remind');
+        if (reminders.length) pendingReminders.set(event.toolCallId, reminders);
       });
       return undefined;
     });
@@ -412,14 +505,13 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         validation: looksLikeValidation(event.toolName, pending?.input ?? event.input),
         isError: event.isError,
         outputDigest: digest(output),
-        outputPreview: redactEvidencePreview(output).replace(/\s+/g, ' ').trim().slice(0, 280),
+        outputPreview: boundedEvidencePreview(output),
         finishedAt: Date.now(),
       };
       manager.toolFinished(evidence);
       if (MUTATION_TOOLS.test(event.toolName)) substantial = true;
       manager.persist();
-      activityEpoch++;
-      await watch({
+      const resultMatches = await watch({
         source: 'tool-result',
         toolName: event.toolName,
         content: `isError:${event.isError}\n${output}`,
@@ -450,23 +542,23 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           });
         }
       }
-      for (const reminder of pendingReminders.splice(0))
-        emit(reminderText(reminder), reminder.severity, ctx);
+      const reminders = [
+        ...(pendingReminders.get(event.toolCallId) ?? []),
+        ...resultMatches.filter((match) => match.effect === 'remind'),
+      ];
+      pendingReminders.delete(event.toolCallId);
+      for (const reminder of reminders) emit(reminderText(reminder), reminder.severity, ctx);
     });
 
-    pi.on('agent_settled', async (_event, ctx) => {
+    pi.on('agent_settled', (_event, ctx) => {
       if (!substantial || !manager.get().objective) return;
       if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
       const task = activeTask(manager.get().taskState);
-      await watch({
+      void watch({
         source: 'lifecycle',
         content: `agent_settled substantial:${substantial} task:${task ? 'active' : 'none'} validation:${manager.get().validationAt ? 'present' : 'missing'} mutations:${manager.get().touchedFiles.length}`,
         snapshot: true,
       });
-      if (pendingReminders.length && !ctx.hasPendingMessages()) {
-        for (const reminder of pendingReminders.splice(0))
-          emit(reminderText(reminder), reminder.severity, ctx);
-      }
       const pendingSemanticMatches = manager.semanticMatches();
       const semanticMatches = pendingSemanticMatches.filter(
         (match) =>
@@ -477,77 +569,39 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         manager.clearSemanticMatches();
         manager.queueSemanticMatches(semanticMatches);
       }
-      if (!semanticMatches.length) {
-        manager.persist();
-        return;
-      }
-      automaticCheckActive = true;
-      try {
-        const binding = await resolveBinding(ctx, false);
-        if (!binding) {
-          const message =
-            'Advisor could not run the different-family semantic check; operations continue and the deterministic warning remains visible.';
-          if (automaticRouteFailure !== message) {
-            automaticRouteFailure = message;
-            emit(message, 'concern', ctx);
-          }
-          return;
-        }
-        const startInputEpoch = inputEpoch;
-        const startActivityEpoch = activityEpoch;
-        let decision: AdvisorDecision;
-        try {
-          decision = await analyze(
-            ctx,
-            binding,
-            manager.get(),
-            'automatic',
-            semanticMatches.length
-              ? `Deterministic watch signals:\n${semanticMatches
-                  .map(
-                    (match) =>
-                      `- ${match.ruleId}: ${match.message}${match.provenance?.source ? ` [source: ${match.provenance.source}]` : ''}`
-                  )
-                  .join('\n')}`
-              : undefined,
-            await resolveHostContext(ctx)
-          );
-        } catch (error) {
-          if (startInputEpoch === inputEpoch && startActivityEpoch === activityEpoch)
-            emit(
-              `Advisor check failed: ${error instanceof Error ? error.message : String(error)}`,
-              'concern',
-              ctx
-            );
-          return;
-        }
-        if (
-          startInputEpoch !== inputEpoch ||
-          startActivityEpoch !== activityEpoch ||
-          ctx.hasPendingMessages()
-        )
-          return;
+      if (semanticMatches.length) {
         manager.clearSemanticMatches();
-        manager.markAnalyzed();
-        handleDecision(decision, ctx);
-        manager.persist();
-      } finally {
-        automaticCheckActive = false;
+        queuePrimaryDelta(ctx, false, semanticMatches);
       }
+      const reconciliation = manager.get().completionReconciliation;
+      if (task && reconciliation?.taskId === task.id && !reconciliation.nudged) {
+        const message = `Task #${task.id} remains active after a rejected completion: ${reconciliation.reason} Resolve that gap from current evidence and retry TaskUpdate before yielding.`;
+        if (!ctx.hasPendingMessages() && emit(message, 'concern', ctx, true)) {
+          manager.markCompletionReconciliationNudged(task.id);
+          manager.persist();
+          return;
+        }
+      }
+      manager.persist();
     });
 
-    const handleDecision = (decision: AdvisorDecision, ctx: ExtensionContext): void => {
+    const handleBackgroundDecision = (
+      completed: { decision: AdvisorDecision; inputEpoch: number; wip: boolean },
+      ctx: ExtensionContext
+    ): void => {
+      if (completed.inputEpoch !== inputEpoch) return;
+      const { decision } = completed;
       if (decision.objectiveInputAt !== undefined) {
         manager.applyObjectiveInput(decision.objectiveInputAt);
       }
       const message = decision.message?.trim();
-      if (decision.verdict === 'PASS') {
-        if (message) emit(message, 'nit', ctx);
-        return;
-      }
+      if (decision.verdict === 'PASS' || decision.verdict === 'UNKNOWN') return;
       if (!message || decision.action === 'silent') return;
       const severity: AdvisorSeverity = decision.action === 'blocker' ? 'blocker' : 'concern';
-      const wantsContinuation = decision.action === 'continue';
+      if (completed.wip && severity !== 'blocker') return;
+      if (decision.confidence < (severity === 'blocker' ? 0.8 : 0.65)) return;
+      if (!emissionGuard.accept(message, severity)) return;
+      const wantsContinuation = decision.action === 'continue' || severity === 'blocker';
       const signature = digest(`${decision.verdict}\u0000${message}`);
       if (wantsContinuation && !ctx.hasPendingMessages() && manager.markContinuation(signature))
         emit(message, severity, ctx, true);
@@ -561,19 +615,22 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
         : undefined;
       watchQueue = Promise.resolve([]);
+      pendingReminders.clear();
       manager.markContinuityPending();
       void watch({ source: 'lifecycle', content: 'session_compact', snapshot: true });
-      disposeAdvisorSession();
+      resetBackground(ctx);
     });
 
-    pi.on('model_select', () => {
+    pi.on('model_select', (_event, ctx) => {
       routeLabel = undefined;
       automaticRouteFailure = undefined;
-      disposeAdvisorSession();
+      pendingReminders.clear();
+      resetBackground(ctx);
     });
     pi.on('session_shutdown', () => {
       if (watcher) manager.setWatchState(watcher.exportState());
       manager.persist();
+      background.reset();
       disposeAdvisorSession();
     });
 
@@ -584,29 +641,27 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         if (question) {
           inputEpoch++;
           manager.bindTrustedInput(question, 'interactive', Date.now(), false);
-        }
-        const binding = await resolveBinding(ctx);
-        if (!binding) {
-          emit(
-            statusText(
-              manager.get(),
-              'UNKNOWN',
-              'No eligible different-family Advisor route is available.'
-            ),
-            'concern',
-            ctx
-          );
-          return;
+          manager.persist();
         }
         let decision: AdvisorDecision;
         try {
-          decision = await analyze(
-            ctx,
-            binding,
-            manager.get(),
-            'question',
-            question || 'Report current status and completion truth.',
-            await resolveHostContext(ctx)
+          decision = await background.runForeground(
+            async () => {
+              const binding = await resolveBinding(ctx);
+              if (!binding)
+                throw new Error('no eligible different-family Advisor route is available');
+              return analyze(
+                ctx,
+                binding,
+                structuredClone(manager.get()),
+                'question',
+                question || 'Report current status and completion truth.',
+                await resolveHostContext(ctx, 'question', false),
+                ctx.signal
+              );
+            },
+            ADVISOR_CATCHUP_MS,
+            ctx.signal
           );
         } catch (error) {
           emit(
@@ -657,12 +712,22 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       }
     );
 
-    async function resolveHostContext(ctx: ExtensionContext): Promise<string | undefined> {
+    async function resolveHostContext(
+      ctx: ExtensionContext,
+      mode: AdvisorAnalysisMode,
+      semanticEscalation: boolean
+    ): Promise<string | undefined> {
       if (!options.resolveContext) return undefined;
       try {
-        return await options.resolveContext(ctx, manager.get());
+        return sanitizeCrossProvider(
+          await options.resolveContext(ctx, manager.get(), mode, semanticEscalation),
+          'host'
+        );
       } catch (error) {
-        return `Host context unavailable: ${error instanceof Error ? error.message : String(error)}`;
+        return sanitizeCrossProvider(
+          `Host context unavailable: ${error instanceof Error ? error.message : String(error)}`,
+          'host'
+        );
       }
     }
   };
@@ -733,6 +798,36 @@ function substantialState(state: ReturnType<AdvisorStateManager['get']>): boolea
       state.touchedFiles.length > 0 ||
       state.toolEvidence.length > 0)
   );
+}
+
+function turnIsInProgress(message: unknown): boolean {
+  if (!message || typeof message !== 'object') return false;
+  const content = (message as { content?: unknown }).content;
+  return Array.isArray(content) && content.some((item) => item?.type === 'toolCall');
+}
+
+function uniqueMatches(matches: WatchMatch[]): WatchMatch[] {
+  return [...new Map(matches.map((match) => [match.signature, match])).values()];
+}
+
+function semanticPrompt(matches: WatchMatch[]): string {
+  return `Deterministic watch signals:\n${matches
+    .map(
+      (match) =>
+        `- ${match.ruleId}: ${match.message}${match.provenance?.source ? ` [source: ${match.provenance.source}]` : ''}`
+    )
+    .join('\n')}`;
+}
+
+function coalescedTranscript(items: BackgroundUpdate[]): string {
+  const rendered = items
+    .map(
+      (item, index) =>
+        `[incremental update ${index + 1}${item.wip ? ' — in progress, more steps follow' : ''}]\n${item.transcript}`
+    )
+    .join('\n\n');
+  if (rendered.length <= 20_000) return rendered;
+  return `${rendered.slice(0, 5_000)}\n… [coalesced background updates bounded] …\n${rendered.slice(-14_950)}`;
 }
 
 function reminderText(match: WatchMatch): string {
@@ -826,17 +921,23 @@ function looksLikeValidation(toolName: string, input: Record<string, unknown>): 
 }
 
 function redactEvidencePreview(value: string): string {
-  return value
-    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [redacted]')
-    .replace(
-      /\b(authorization|api[_-]?key|token|password|secret)\s*[:=]\s*["']?[^\s"',}]+/gi,
-      '$1=[redacted]'
-    )
-    .replace(/\b(?:sk|dk|ghp|github_pat)-[A-Za-z0-9_-]{8,}\b/g, '[redacted credential]');
+  return redactCrossProviderSecrets(value);
+}
+
+function boundedEvidencePreview(value: string): string {
+  const compact = redactEvidencePreview(value.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, ''))
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && /[\p{L}\p{N}]/u.test(line))
+    .join(' ⏎ ');
+
+  if (compact.length <= EVIDENCE_PREVIEW_LIMIT) return compact;
+  const tailLength = EVIDENCE_PREVIEW_LIMIT - EVIDENCE_PREVIEW_HEAD - 3;
+  return `${compact.slice(0, EVIDENCE_PREVIEW_HEAD)} … ${compact.slice(-tailLength)}`;
 }
 
 export { CONTINUITY_EVENT };
-export type { AdvisorHostOptions, AdvisorModelBinding } from './types.js';
+export type { AdvisorAnalysisMode, AdvisorHostOptions, AdvisorModelBinding } from './types.js';
 export { validateWatchContract, WatchEngine } from './watch/engine.js';
 export type {
   AstMatchRequest,

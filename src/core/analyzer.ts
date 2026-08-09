@@ -5,19 +5,26 @@ import {
   formatForSupervisor,
 } from '../compaction/index.js';
 import { callAdvisorModel } from '../session/client.js';
-import type { AdvisorDecision, AdvisorModelBinding, AdvisorState } from '../types.js';
+import type {
+  AdvisorAnalysisMode,
+  AdvisorDecision,
+  AdvisorModelBinding,
+  AdvisorState,
+} from '../types.js';
 import { ADVISOR_SYSTEM_PROMPT, buildAdvisorPrompt } from './prompt-builder.js';
 
 export async function analyze(
   ctx: ExtensionContext,
   binding: AdvisorModelBinding,
   state: AdvisorState,
-  mode: 'automatic' | 'completion' | 'question',
+  mode: AdvisorAnalysisMode,
   question?: string,
   hostContext?: string,
-  signal: AbortSignal | undefined = ctx.signal
+  signal?: AbortSignal,
+  transcriptOverride?: string
 ): Promise<AdvisorDecision> {
-  const transcript = formatForSupervisor(buildCompactionSummary(extractMessages(ctx)));
+  const transcript =
+    transcriptOverride ?? formatForSupervisor(buildCompactionSummary(extractMessages(ctx)));
   return callAdvisorModel(
     ctx,
     binding,
