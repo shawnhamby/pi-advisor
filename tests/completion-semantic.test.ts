@@ -173,6 +173,120 @@ test('signature revalidation suppresses a result after uncached context drift', 
   );
 });
 
+test('task-local evidence drift suppresses a late semantic result', async () => {
+  const cache = new CompletionSemanticCache();
+  const pending = deferred<AdvisorDecision>();
+  const currentState = state();
+  const runtime = runtimeState();
+  const task = { id: '1', metadata: { evidence: { observed: 'before' } } };
+  const signature = completionSignature('1', task, currentState, runtime);
+  let followUps = 0;
+
+  ask(
+    cache,
+    signature,
+    () => pending.promise,
+    () => completionSignature('1', task, currentState, runtime) === signature,
+    () => followUps++
+  );
+  task.metadata.evidence.observed = 'after';
+  pending.resolve(PASS);
+  await tick();
+
+  assert.equal(followUps, 0);
+  assert.notEqual(completionSignature('1', task, currentState, runtime), signature);
+});
+
+test('successful observation tools do not cancel or stale a pending completion check', async () => {
+  const cache = new CompletionSemanticCache();
+  const pending = deferred<AdvisorDecision>();
+  const currentState = state();
+  const runtime = runtimeState();
+  const task = { id: '1', subject: 'demo' };
+  const signature = completionSignature('1', task, currentState, runtime);
+  let followUps = 0;
+
+  ask(
+    cache,
+    signature,
+    () => pending.promise,
+    () => completionSignature('1', task, currentState, runtime) === signature,
+    () => followUps++
+  );
+  for (const [toolName, input] of [
+    ['grep', { pattern: 'P1_4' }],
+    ['readSeek_digest', { path: 'evidence.txt' }],
+    ['lsp_definition', { path: 'evidence.py' }],
+    ['TaskGet', { taskId: '1' }],
+    ['TaskList', {}],
+    ['subagent_wait', { id: 'run-1' }],
+    ['subagent', { action: 'status', id: 'run-1' }],
+    ['list_agents', {}],
+    ['herdr_layout', { action: 'current' }],
+    ['herdr_pane', { action: 'read', pane: 'p1' }],
+    ['herdr_agent', { action: 'list' }],
+  ] as const) {
+    cache.invalidateForTool(toolName, input);
+    currentState.activeTools[toolName] = { name: toolName, startedAt: 1 };
+    delete currentState.activeTools[toolName];
+    currentState.toolEvidence.push(evidence(toolName));
+    cache.invalidateForTool(toolName, input);
+  }
+  pending.resolve(PASS);
+  await tick();
+
+  assert.equal(followUps, 1);
+  assert.deepEqual(
+    ask(cache, signature, async () => UNKNOWN),
+    { kind: 'pass' }
+  );
+});
+
+test('mutating, executing, mixed, unknown, and failed observation tools invalidate', () => {
+  for (const [toolName, input, isError] of [
+    ['bash', { command: 'pwd' }, false],
+    ['write', { path: 'evidence.txt' }, false],
+    ['TaskUpdate', { taskId: '1', status: 'in_progress' }, false],
+    ['spawn_agent', { task: 'work' }, false],
+    ['create_thread', { prompt: 'work' }, false],
+    ['subagent', { agent: 'coding', task: 'work' }, false],
+    ['subagent', { action: 'status', id: 'run-1' }, true],
+    ['subagent', { action: 'steer', id: 'run-1' }, false],
+    ['herdr_agent', { action: 'prompt' }, false],
+    ['custom_unknown_tool', {}, false],
+  ] as const) {
+    const cache = new CompletionSemanticCache();
+    const pending = deferred<AdvisorDecision>();
+    let aborted = false;
+    ask(cache, toolName, (signal) => {
+      signal.addEventListener('abort', () => {
+        aborted = true;
+        pending.resolve(PASS);
+      });
+      return pending.promise;
+    });
+    cache.invalidateForTool(toolName, input, isError);
+    assert.equal(aborted, true, toolName);
+  }
+});
+
+test('completion signature contains authoritative facts, not later tool activity', () => {
+  const currentState = state();
+  const runtime = runtimeState();
+  const task = { id: '1', subject: 'demo', metadata: { evidence: { observed: 'done' } } };
+  const signature = completionSignature('1', task, currentState, runtime);
+
+  currentState.activeTools.write = { name: 'write', startedAt: 1 };
+  currentState.toolEvidence.push(evidence('write'));
+  assert.equal(completionSignature('1', task, currentState, runtime), signature);
+
+  currentState.blockers.push('write failed');
+  assert.notEqual(completionSignature('1', task, currentState, runtime), signature);
+  currentState.blockers = [];
+  task.metadata.evidence.observed = 'changed';
+  assert.notEqual(completionSignature('1', task, currentState, runtime), signature);
+});
+
 test('signature is key-stable and excludes Advisor bookkeeping', () => {
   const runtime: CompletionRuntimeSnapshot = {
     cwd: '/tmp/example',
@@ -204,6 +318,27 @@ function state(): AdvisorState {
     toolEvidence: [],
     activeTools: {},
     trustedInputs: [],
+  };
+}
+
+function runtimeState(): CompletionRuntimeSnapshot {
+  return {
+    cwd: '/tmp/example',
+    modelProvider: 'openai-codex',
+    modelId: 'gpt-5.6-sol',
+    systemPromptDigest: 'system',
+  };
+}
+
+function evidence(toolName: string): AdvisorState['toolEvidence'][number] {
+  return {
+    toolCallId: `${toolName}-1`,
+    toolName,
+    input: {},
+    isError: false,
+    outputDigest: 'digest',
+    outputPreview: 'complete',
+    finishedAt: 1,
   };
 }
 

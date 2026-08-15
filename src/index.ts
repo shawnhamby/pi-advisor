@@ -546,8 +546,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     pi.on('tool_call', async (event: ToolCallEvent, ctx) => {
       const completionBlocked = await completionGate(event, ctx);
       if (completionBlocked) return completionBlocked;
-      completionSemantic.invalidate();
       const input = structuredClone(event.input as Record<string, unknown>);
+      completionSemantic.invalidateForTool(event.toolName, input);
       pendingInputs.set(event.toolCallId, { name: event.toolName, input });
       manager.toolStarted(event.toolCallId, event.toolName, input);
       if (HIGH_SIGNAL_TOOLS.test(event.toolName)) substantial = true;
@@ -566,8 +566,12 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
 
     pi.on('tool_result', async (event: ToolResultEvent, ctx) => {
-      completionSemantic.invalidate();
       const pending = pendingInputs.get(event.toolCallId);
+      completionSemantic.invalidateForTool(
+        event.toolName,
+        pending?.input ?? event.input,
+        event.isError
+      );
       pendingInputs.delete(event.toolCallId);
       const output = event.content
         .map((item) => (item.type === 'text' ? item.text : `[${item.type}]`))

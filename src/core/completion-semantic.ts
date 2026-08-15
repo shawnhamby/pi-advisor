@@ -101,12 +101,72 @@ export class CompletionSemanticCache {
     this.entries.clear();
   }
 
+  invalidateForTool(toolName: string, input: Record<string, unknown> = {}, isError = false): void {
+    if (!isError && isCompletionObservationTool(toolName, input)) return;
+    this.invalidate();
+  }
+
   private isCurrent(signature: string, entry: RunningEntry): boolean {
     return this.generation === entry.generation && this.entries.get(signature) === entry;
   }
 }
 
 export const COMPLETION_PASS_TTL_MS = 60_000;
+
+/**
+ * Successful observation tools do not change the completion facts captured at
+ * the gate. Unknown and mixed tools fail closed unless their action is a
+ * proven read-only operation.
+ */
+export function isCompletionObservationTool(
+  toolName: string,
+  input: Record<string, unknown> = {}
+): boolean {
+  const name = toolName.toLowerCase();
+  if (COMPLETION_OBSERVATION_TOOLS.has(name)) return true;
+  const action = typeof input.action === 'string' ? input.action.toLowerCase() : '';
+  return COMPLETION_OBSERVATION_ACTIONS[name]?.has(action) ?? false;
+}
+
+const COMPLETION_OBSERVATION_TOOLS = new Set([
+  'read',
+  'digest',
+  'grep',
+  'find',
+  'ls',
+  'list',
+  'readseek_digest',
+  'readseek_grep',
+  'readseek_search',
+  'readseek_view',
+  'readseek_def',
+  'readseek_refs',
+  'lsp_diagnostics',
+  'lsp_diagnostics_many',
+  'lsp_find_symbol',
+  'lsp_hover',
+  'lsp_definition',
+  'lsp_references',
+  'lsp_implementation',
+  'lsp_document_symbols',
+  'lsp_preview_rename',
+  'taskget',
+  'tasklist',
+  'subagent_wait',
+  'subagent_status',
+  'wait_agent',
+  'list_agents',
+  'agent_list',
+  'agent_status',
+  'view_image',
+]);
+
+const COMPLETION_OBSERVATION_ACTIONS: Record<string, ReadonlySet<string>> = {
+  subagent: new Set(['status']),
+  herdr_layout: new Set(['current', 'workspace_list', 'tab_list', 'pane_list', 'pane_layout']),
+  herdr_pane: new Set(['get', 'read', 'wait_output']),
+  herdr_agent: new Set(['list', 'get', 'wait', 'read']),
+};
 
 export function completionSignature(
   taskId: string,
@@ -126,8 +186,6 @@ export function completionSignature(
       touchedFiles: state.touchedFiles,
       validationAt: state.validationAt,
       blockers: state.blockers,
-      toolEvidence: state.toolEvidence,
-      activeTools: state.activeTools,
       lastTrustedInput: state.lastTrustedInput,
     })
   );
