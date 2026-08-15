@@ -6,7 +6,11 @@ import type {
   AdvisorModelBinding,
   AdvisorState,
 } from '../types.js';
-import { ADVISOR_SYSTEM_PROMPT, buildAdvisorPrompt } from './prompt-builder.js';
+import {
+  ADVISOR_SYSTEM_PROMPT,
+  buildAdvisorPrompt,
+  transcriptForAnalysis,
+} from './prompt-builder.js';
 import { sanitizedTranscriptSnapshot } from './transcript-delta.js';
 
 export async function analyze(
@@ -19,12 +23,17 @@ export async function analyze(
   signal?: AbortSignal,
   transcriptOverride?: string
 ): Promise<AdvisorDecision> {
-  const transcript = transcriptOverride ?? sanitizedTranscriptSnapshot(ctx) ?? '(none)';
+  const transcript = transcriptForAnalysis(
+    mode,
+    mode === 'completion' ? undefined : sanitizedTranscriptSnapshot(ctx),
+    transcriptOverride
+  );
   return callAdvisorModel(
     ctx,
     binding,
     ADVISOR_SYSTEM_PROMPT,
     buildAdvisorPrompt(state, transcript, mode, question, hostContext),
-    signal
+    signal,
+    mode
   );
 }
