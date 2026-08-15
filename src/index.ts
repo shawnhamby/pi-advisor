@@ -15,6 +15,7 @@ import { analyze } from './core/analyzer.js';
 import { IncrementalAdvisorQueue } from './core/background-queue.js';
 import {
   completionCorrection,
+  hasTaskLocalCompletionEvidence,
   reconcileActiveTools,
   withCompletionAnalysisBudget,
 } from './core/completion-control.js';
@@ -253,6 +254,9 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           `Task #${taskId} is still blocked by ${blockers.map((id) => `#${id}`).join(', ')}. Resolve those tasks before retrying completion.`
         );
       }
+      if (!hasTaskLocalCompletionEvidence(task)) {
+        return reject(completionCorrection(taskId, 'task-local concrete evidence is missing'));
+      }
       const activeToolIds = reconcileActiveTools(manager.get().activeTools, pendingInputs.keys());
       if (activeToolIds.length > 0) {
         return reject(
@@ -263,25 +267,25 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       const startInputEpoch = inputEpoch;
       try {
         const decision = await withCompletionAnalysisBudget(
-          (completionSignal, catchupMs) =>
-            background.runForeground(
-              async () => {
-                const binding = await resolveBinding(ctx, false);
-                if (!binding)
-                  throw new Error('no eligible different-family Advisor route is available');
-                return analyze(
-                  ctx,
-                  binding,
-                  structuredClone(manager.get()),
-                  'completion',
-                  `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${sanitizeCrossProvider(String(task.subject ?? ''), 'tool')}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
-                  await resolveHostContext(ctx, 'completion', false),
-                  completionSignal
-                );
-              },
-              catchupMs,
-              completionSignal
-            ),
+          (catchupSignal, catchupMs) => background.acquireForeground(catchupMs, catchupSignal),
+          async (completionSignal, releaseForeground) => {
+            try {
+              const binding = await resolveBinding(ctx, false);
+              if (!binding)
+                throw new Error('no eligible different-family Advisor route is available');
+              return analyze(
+                ctx,
+                binding,
+                structuredClone(manager.get()),
+                'completion',
+                `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${sanitizeCrossProvider(String(task.subject ?? ''), 'tool')}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
+                await resolveHostContext(ctx, 'completion', false),
+                completionSignal
+              );
+            } finally {
+              releaseForeground();
+            }
+          },
           ctx.signal
         );
         if (startInputEpoch !== inputEpoch) {

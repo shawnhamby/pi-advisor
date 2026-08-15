@@ -78,6 +78,15 @@ export class IncrementalAdvisorQueue<T> {
     maxCatchupMs: number,
     signal?: AbortSignal
   ): Promise<R> {
+    const release = await this.acquireForeground(maxCatchupMs, signal);
+    try {
+      return await work();
+    } finally {
+      release();
+    }
+  }
+
+  async acquireForeground(maxCatchupMs: number, signal?: AbortSignal): Promise<() => void> {
     const startedAt = Date.now();
     const previous = this.foregroundTail;
     let release!: () => void;
@@ -101,15 +110,16 @@ export class IncrementalAdvisorQueue<T> {
       throw new Error(`Advisor catch-up exceeded ${Math.round(maxCatchupMs / 1000)} seconds`);
     }
     this.busy = true;
-    try {
-      return await work();
-    } finally {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
       this.busy = false;
       this.foreground = false;
       release();
       this.notifyCaughtUp();
       void this.drain();
-    }
+    };
   }
 
   private async drain(): Promise<void> {

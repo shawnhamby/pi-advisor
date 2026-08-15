@@ -20,19 +20,26 @@ export class SupervisorSession {
   private session: Awaited<ReturnType<typeof createAgentSession>>['session'] | null = null;
   private model: any = null;
   private systemPrompt: string = '';
+  private toolsEnabled: boolean | null = null;
 
   async ensureStarted(
     ctx: ExtensionContext,
     provider: string,
     modelId: string,
     systemPrompt: string,
-    effort: string
+    effort: string,
+    toolsEnabled = true
   ): Promise<boolean> {
     // If model or system prompt changed, need new session
     const newModel = ctx.modelRegistry.find(provider, modelId);
     if (!newModel) return false;
 
-    if (this.session && this.model === newModel && this.systemPrompt === systemPrompt) {
+    if (
+      this.session &&
+      this.model === newModel &&
+      this.systemPrompt === systemPrompt &&
+      this.toolsEnabled === toolsEnabled
+    ) {
       // Session reusable
       return true;
     }
@@ -58,13 +65,14 @@ export class SupervisorSession {
         agentDir: getAgentDir(),
         model: newModel,
         thinkingLevel: effort as NonNullable<CreateAgentSessionOptions['thinkingLevel']>,
-        tools: ['read', 'grep', 'find'],
-        customTools: advisorTools(ctx.cwd),
+        tools: advisorBuiltInTools(toolsEnabled),
+        customTools: toolsEnabled ? advisorTools(ctx.cwd) : [],
         resourceLoader: loader,
       });
       this.session = result.session;
       this.model = newModel;
       this.systemPrompt = systemPrompt;
+      this.toolsEnabled = toolsEnabled;
       return true;
     } catch {
       return false;
@@ -122,12 +130,17 @@ export class SupervisorSession {
     }
     this.model = null;
     this.systemPrompt = '';
+    this.toolsEnabled = null;
   }
 
   private discard(session: NonNullable<SupervisorSession['session']>): void {
     if (this.session !== session) return;
     this.dispose();
   }
+}
+
+export function advisorBuiltInTools(toolsEnabled: boolean): Array<'read' | 'grep' | 'find'> {
+  return toolsEnabled ? ['read', 'grep', 'find'] : [];
 }
 
 function advisorTools(cwd: string) {

@@ -1,6 +1,8 @@
 import type { AdvisorAnalysisMode, AdvisorState } from '../types.js';
 import { type CrossProviderSource, sanitizeCrossProvider } from './cross-provider-sanitizer.js';
 
+export const COMPLETION_TRANSCRIPT = '[completion uses structured task and runtime evidence]';
+
 export const ADVISOR_SYSTEM_PROMPT = `You are Advisor, a quiet peer reviewer shadowing a coding agent from a different angle.
 
 Look where the primary agent is not. Sharpen strategy, correctness, robustness, and completion truth without re-running reasoning already present. Prefer silence when the agent is right or productively resolving work. Never restate errors, diagnostics, failed commands, or risks the transcript already shows the agent has observed. Low-confidence technical risk, vague unease, and intent ambiguity require silence.
@@ -65,6 +67,16 @@ export function buildAdvisorPrompt(
   ]
     .filter(Boolean)
     .join('\n\n');
+}
+
+export function transcriptForAnalysis(
+  mode: AdvisorAnalysisMode,
+  transcriptSnapshot?: string,
+  transcriptOverride?: string
+): string {
+  if (transcriptOverride !== undefined) return transcriptOverride;
+  if (mode === 'completion') return COMPLETION_TRANSCRIPT;
+  return transcriptSnapshot ?? '(none)';
 }
 
 function sanitizedJson(value: unknown, source: CrossProviderSource): string {

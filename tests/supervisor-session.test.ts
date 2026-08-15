@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { SupervisorSession } from '../src/session/supervisor-session.ts';
+import { advisorSessionToolsEnabled } from '../src/session/client.ts';
+import { advisorBuiltInTools, SupervisorSession } from '../src/session/supervisor-session.ts';
 
 test('aborting a prompt immediately discards a provider request that does not settle', async () => {
   let disposed = false;
@@ -30,4 +31,18 @@ test('aborting a prompt immediately discards a provider request that does not se
   assert.equal(outcome, null);
   assert.equal(disposed, true);
   assert.equal(Reflect.get(supervisor, 'session'), null);
+});
+
+test('completion disables private tools while automatic and question modes retain them', () => {
+  assert.equal(advisorSessionToolsEnabled('completion'), false);
+  assert.deepEqual(advisorBuiltInTools(advisorSessionToolsEnabled('completion')), []);
+
+  for (const mode of ['automatic', 'question'] as const) {
+    assert.equal(advisorSessionToolsEnabled(mode), true);
+    assert.deepEqual(advisorBuiltInTools(advisorSessionToolsEnabled(mode)), [
+      'read',
+      'grep',
+      'find',
+    ]);
+  }
 });
