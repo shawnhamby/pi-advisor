@@ -1,0 +1,6 @@
+Adversarial review: PASS
+Reviewer: grok:high via Grok Build (grok-4.6/high)
+Initial review: REJECT on live evidence shape and non-independent timeout
+Focused correction review: PASS, request 6bbb4bd5-cb07-426d-bc8a-666175d0eb5c
+Final staged diff SHA-256: 581f5e59c2a09f6d9404752634ff76fedf549c652a5d2e68db8a0ccf8b75bfa9
+Verification: focused tests 10/10; typecheck; format; diff check
