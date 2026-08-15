@@ -76,22 +76,36 @@ export class SupervisorSession {
     signal?: AbortSignal,
     onDelta?: (accumulated: string) => void
   ): Promise<string | null> {
-    if (!this.session) return null;
-
-    const onAbort = () => this.session?.abort();
-    signal?.addEventListener('abort', onAbort, { once: true });
+    const session = this.session;
+    if (!session) return null;
+    if (signal?.aborted) {
+      this.discard(session);
+      return null;
+    }
 
     let responseText = '';
-    const unsubscribe = this.session.subscribe((event) => {
+    const unsubscribe = session.subscribe((event) => {
       if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
         responseText += event.assistantMessageEvent.delta;
         onDelta?.(responseText);
       }
     });
+    let rejectAbort: ((error: Error) => void) | undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      rejectAbort = reject;
+    });
+    const onAbort = (): void => {
+      this.discard(session);
+      rejectAbort?.(new Error('advisor prompt aborted'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     try {
-      await this.session.prompt(userPrompt);
+      await (signal
+        ? Promise.race([session.prompt(userPrompt), aborted])
+        : session.prompt(userPrompt));
     } catch {
+      this.discard(session);
       return null;
     } finally {
       unsubscribe();
@@ -107,6 +121,12 @@ export class SupervisorSession {
       this.session = null;
     }
     this.model = null;
+    this.systemPrompt = '';
+  }
+
+  private discard(session: NonNullable<SupervisorSession['session']>): void {
+    if (this.session !== session) return;
+    this.dispose();
   }
 }
 
