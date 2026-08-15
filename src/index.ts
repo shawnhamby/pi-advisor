@@ -14,6 +14,11 @@ import { Container, Text } from '@earendil-works/pi-tui';
 import { analyze } from './core/analyzer.js';
 import { IncrementalAdvisorQueue } from './core/background-queue.js';
 import {
+  completionCorrection,
+  reconcileActiveTools,
+  withCompletionAnalysisTimeout,
+} from './core/completion-control.js';
+import {
   redactCrossProviderSecrets,
   sanitizeCrossProvider,
 } from './core/cross-provider-sanitizer.js';
@@ -40,6 +45,7 @@ const CONTINUITY_EVENT = 'pi-advisor:continuity-restored';
 const EVIDENCE_PREVIEW_LIMIT = 720;
 const EVIDENCE_PREVIEW_HEAD = 200;
 const ADVISOR_CATCHUP_MS = 30_000;
+const COMPLETION_ANALYSIS_TIMEOUT_MS = 10_000;
 const HIGH_SIGNAL_TOOLS =
   /^(?:bash|exec|edit|write|TaskCreate|TaskUpdate|task_plan|task_update|task_evidence|task_complete|spawn_agent|create_thread)$/i;
 const MUTATION_TOOLS = /^(?:edit|write|patch|apply_patch|delete|rename|move|readSeek_rename)$/i;
@@ -247,7 +253,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           `Task #${taskId} is still blocked by ${blockers.map((id) => `#${id}`).join(', ')}. Resolve those tasks before retrying completion.`
         );
       }
-      if (Object.keys(manager.get().activeTools).length > 0) {
+      const activeToolIds = reconcileActiveTools(manager.get().activeTools, pendingInputs.keys());
+      if (activeToolIds.length > 0) {
         return reject(
           `Task #${taskId} still has active tool work. Let it settle, verify the result, and retry completion.`
         );
@@ -255,22 +262,27 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
 
       const startInputEpoch = inputEpoch;
       try {
-        const decision = await background.runForeground(
-          async () => {
-            const binding = await resolveBinding(ctx, false);
-            if (!binding)
-              throw new Error('no eligible different-family Advisor route is available');
-            return analyze(
-              ctx,
-              binding,
-              structuredClone(manager.get()),
-              'completion',
-              `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${sanitizeCrossProvider(String(task.subject ?? ''), 'tool')}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
-              await resolveHostContext(ctx, 'completion', false),
-              ctx.signal
-            );
-          },
-          ADVISOR_CATCHUP_MS,
+        const decision = await withCompletionAnalysisTimeout(
+          (completionSignal) =>
+            background.runForeground(
+              async () => {
+                const binding = await resolveBinding(ctx, false);
+                if (!binding)
+                  throw new Error('no eligible different-family Advisor route is available');
+                return analyze(
+                  ctx,
+                  binding,
+                  structuredClone(manager.get()),
+                  'completion',
+                  `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${sanitizeCrossProvider(String(task.subject ?? ''), 'tool')}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
+                  await resolveHostContext(ctx, 'completion', false),
+                  completionSignal
+                );
+              },
+              COMPLETION_ANALYSIS_TIMEOUT_MS,
+              completionSignal
+            ),
+          COMPLETION_ANALYSIS_TIMEOUT_MS,
           ctx.signal
         );
         if (startInputEpoch !== inputEpoch) {
@@ -285,12 +297,10 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         }
         const reason = decision.message?.trim() || decision.reasoning.trim();
         return reject(
-          `Task #${taskId} is not yet verified complete${reason ? `: ${reason}` : '.'} Keep working, then retry TaskUpdate.`
+          completionCorrection(taskId, decision.verdict === 'GAP' ? reason : undefined)
         );
       } catch (error) {
-        return reject(
-          `Advisor could not verify task #${taskId}: ${error instanceof Error ? error.message : String(error)}. Keep it in progress, continue the work, and retry completion.`
-        );
+        return reject(completionCorrection(taskId));
       }
     };
 
