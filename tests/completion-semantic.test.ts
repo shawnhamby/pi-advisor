@@ -270,6 +270,56 @@ test('task-local evidence drift suppresses a late semantic result', async () => 
   assert.notEqual(completionSignature('1', task, currentState, runtime), signature);
 });
 
+test('late automatic objective reconciliation does not cancel an accepted completion check', async () => {
+  const cache = new CompletionSemanticCache();
+  const pending = deferred<AdvisorDecision>();
+  const currentState = state();
+  const runtime = runtimeState();
+  const task = { id: '1', status: 'in_progress', metadata: { evidence: { observed: 'done' } } };
+  const signature = completionSignature('1', task, currentState, runtime);
+  let followUps = 0;
+
+  ask(
+    cache,
+    signature,
+    () => pending.promise,
+    () => completionSignature('1', task, currentState, runtime) === signature,
+    () => followUps++
+  );
+
+  currentState.objective = 'the automatic lane reconciled the latest trusted input';
+  currentState.objectiveUpdatedAt = 2;
+  pending.resolve(PASS);
+  await tick();
+
+  assert.equal(followUps, 1);
+  assert.deepEqual(
+    ask(cache, signature, async () => UNKNOWN),
+    { kind: 'pass' }
+  );
+});
+
+test('material task and trusted-input drift still invalidate completion signatures', () => {
+  const currentState = state();
+  const runtime = runtimeState();
+  const task = { id: '1', status: 'in_progress', metadata: { evidence: { observed: 'done' } } };
+  const signature = completionSignature('1', task, currentState, runtime);
+
+  assert.notEqual(
+    completionSignature('1', { ...task, status: 'completed' }, currentState, runtime),
+    signature
+  );
+  assert.notEqual(
+    completionSignature(
+      '1',
+      task,
+      { ...currentState, lastTrustedInput: { text: 'new request', source: 'rpc', at: 2 } },
+      runtime
+    ),
+    signature
+  );
+});
+
 test('successful observation tools do not cancel or stale a pending completion check', async () => {
   const cache = new CompletionSemanticCache();
   const pending = deferred<AdvisorDecision>();

@@ -200,8 +200,6 @@ export function completionSignature(
       taskId,
       task,
       runtime,
-      objective: state.objective,
-      objectiveUpdatedAt: state.objectiveUpdatedAt,
       plan: state.plan,
       instructions: state.instructions,
       touchedFiles: state.touchedFiles,
