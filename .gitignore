@@ -1,3 +1,15 @@
+# Environment variables and secrets (GIT.MD / SECURITY.MD — include in every repo)
+.env
+.env.*
+*.key
+*.pem
+*.p12
+credentials.json
+credentials*
+secrets.json
+secrets/
+config.local.json
+
 node_modules/
 coverage/
 *.log

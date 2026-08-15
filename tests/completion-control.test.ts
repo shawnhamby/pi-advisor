@@ -5,7 +5,7 @@ import {
   completionCorrection,
   hasTaskLocalCompletionEvidence,
   reconcileActiveTools,
-  withCompletionAnalysisBudget,
+  withCompletionForegroundLease,
   withCompletionAnalysisTimeout,
 } from '../src/core/completion-control.ts';
 
@@ -48,85 +48,57 @@ test('completion analysis clears its timeout after ordinary completion', async (
   assert.equal(aborted, false);
 });
 
-test('parent cancellation propagates through the independent completion phases', async () => {
+test('detached completion uses independent catchup and 60s decision budgets and releases once', async () => {
+  let releaseCount = 0;
+  let observedCatchupMs = 0;
+  const result = await withCompletionForegroundLease(
+    async (_signal, catchupMs) => {
+      observedCatchupMs = catchupMs;
+      return () => releaseCount++;
+    },
+    async () => 'PASS',
+    undefined,
+    { catchupMs: 3_000, timeoutMs: 60_000 }
+  );
+
+  assert.equal(result, 'PASS');
+  assert.equal(observedCatchupMs, 3_000);
+  assert.equal(releaseCount, 1);
+
+  await assert.rejects(
+    withCompletionForegroundLease(
+      async () => () => releaseCount++,
+      async () => new Promise<never>(() => {}),
+      undefined,
+      { catchupMs: 20, timeoutMs: 10 }
+    ),
+    CompletionAnalysisTimeoutError
+  );
+  assert.equal(releaseCount, 2);
+
   const parent = new AbortController();
   let decisionAborted = false;
-  const result = withCompletionAnalysisBudget(
-    async () => 'caught-up',
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const cancelled = withCompletionForegroundLease(
+    async () => () => releaseCount++,
     (signal) =>
-      new Promise<never>((_resolve, reject) => {
+      new Promise<never>(() => {
+        markStarted();
         signal.addEventListener('abort', () => {
           decisionAborted = true;
-          reject(new Error('decision aborted'));
         });
       }),
     parent.signal,
     { catchupMs: 50, timeoutMs: 50 }
   );
-  setTimeout(() => parent.abort(), 5);
-
-  await assert.rejects(result);
+  await started;
+  parent.abort();
+  await assert.rejects(cancelled);
   assert.equal(decisionAborted, true);
-});
-
-test('completion analysis receives its decision budget after catchup and remains bounded', async () => {
-  const startedAt = Date.now();
-  const result = await withCompletionAnalysisBudget(
-    async (_signal, catchupMs) => {
-      assert.equal(catchupMs, 40);
-      await new Promise((resolve) => setTimeout(resolve, 30));
-      return 'caught-up';
-    },
-    async (_signal, caught) => {
-      assert.equal(caught, 'caught-up');
-      await new Promise((resolve) => setTimeout(resolve, 15));
-      return 'PASS';
-    },
-    undefined,
-    { catchupMs: 40, timeoutMs: 20 }
-  );
-
-  assert.equal(result, 'PASS');
-  assert.ok(Date.now() - startedAt > 20);
-
-  let decisionStarted = false;
-  let catchupAborted = false;
-  await assert.rejects(
-    withCompletionAnalysisBudget(
-      (signal) =>
-        new Promise<void>(() => {
-          signal.addEventListener('abort', () => {
-            catchupAborted = true;
-          });
-        }),
-      async () => {
-        decisionStarted = true;
-        return 'unreachable';
-      },
-      undefined,
-      { catchupMs: 20, timeoutMs: 60 }
-    ),
-    CompletionAnalysisTimeoutError
-  );
-  assert.equal(catchupAborted, true);
-  assert.equal(decisionStarted, false);
-
-  let decisionAborted = false;
-  await assert.rejects(
-    withCompletionAnalysisBudget(
-      async () => 'caught-up',
-      (signal) =>
-        new Promise<never>(() => {
-          signal.addEventListener('abort', () => {
-            decisionAborted = true;
-          });
-        }),
-      undefined,
-      { catchupMs: 60, timeoutMs: 20 }
-    ),
-    CompletionAnalysisTimeoutError
-  );
-  assert.equal(decisionAborted, true);
+  assert.equal(releaseCount, 3);
 });
 
 test('active-tool reconciliation removes terminal entries and preserves live work', () => {

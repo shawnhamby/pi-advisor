@@ -17,8 +17,14 @@ import {
   completionCorrection,
   hasTaskLocalCompletionEvidence,
   reconcileActiveTools,
-  withCompletionAnalysisBudget,
+  withCompletionForegroundLease,
 } from './core/completion-control.js';
+import {
+  CompletionSemanticCache,
+  completionSignature,
+  runtimeSnapshot,
+  type CompletionRuntimeSnapshot,
+} from './core/completion-semantic.js';
 import {
   redactCrossProviderSecrets,
   sanitizeCrossProvider,
@@ -73,6 +79,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     const pendingReminders = new Map<string, WatchMatch[]>();
     const transcript = new TranscriptDeltaRecorder();
     const emissionGuard = new AdvisorEmissionGuard();
+    const completionSemantic = new CompletionSemanticCache();
+    let completionRuntime: CompletionRuntimeSnapshot | undefined;
     let needsHostPrimeGeneration = -1;
 
     const watch = (input: WatchInput): Promise<WatchMatch[]> => {
@@ -98,12 +106,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       });
     };
 
-    const emit = (
-      message: string,
-      severity: AdvisorSeverity,
-      ctx: ExtensionContext,
-      continuation = false
-    ): boolean => {
+    const emit = (message: string, severity: AdvisorSeverity, continuation = false): boolean => {
       const trimmed = message.trim();
       if (!trimmed) return false;
       const signature = digest(`${severity}\u0000${trimmed}`);
@@ -128,6 +131,25 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       return true;
     };
 
+    const emitCompletionFollowUp = (message: string, severity: AdvisorSeverity): void => {
+      const trimmed = message.trim();
+      if (!trimmed) return;
+      pi.sendMessage(
+        {
+          customType: ADVISOR_MESSAGE,
+          content: `<advisor severity="${severity}">${trimmed}</advisor>`,
+          display: true,
+          details: {
+            notes: [{ note: trimmed, severity }],
+            route: routeLabel,
+            source: 'advisor',
+            agentAttributed: true,
+          },
+        },
+        { deliverAs: 'followUp', triggerTurn: true }
+      );
+    };
+
     const resolveBinding = async (
       ctx: ExtensionContext,
       reportFailure = true
@@ -142,7 +164,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         const message = `Advisor route failed: ${error instanceof Error ? error.message : String(error)}`;
         if (reportFailure && automaticRouteFailure !== message) {
           automaticRouteFailure = message;
-          emit(message, 'concern', ctx);
+          emit(message, 'concern');
         }
         return undefined;
       }
@@ -152,9 +174,14 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       event: BeforeAgentStartEvent,
       ctx: ExtensionContext
     ): Promise<void> => {
+      const before = completionMetadataSignature(manager.get(), completionRuntime);
       manager.setInstructions(parseInstructions(event.systemPrompt));
       const plan = await detectPlan(event.prompt, ctx.cwd);
       if (plan) manager.setPlan(plan);
+      completionRuntime = runtimeSnapshot(ctx.cwd, ctx.model, event.systemPrompt);
+      if (before !== completionMetadataSignature(manager.get(), completionRuntime)) {
+        completionSemantic.invalidate();
+      }
       manager.persist();
     };
 
@@ -237,9 +264,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       substantial = true;
 
       const taskId = typeof input.taskId === 'string' ? input.taskId : '';
-      const reject = (reason: string): ToolCallEventResult => {
-        manager.setCompletionReconciliation(taskId, reason);
-        manager.persist();
+      const reject = (reason: string, reconcile = true): ToolCallEventResult => {
+        if (reconcile) {
+          manager.setCompletionReconciliation(taskId, reason);
+          manager.persist();
+        }
         return rejectCompletion(reason);
       };
       const task = taskById(manager.get().taskState, taskId);
@@ -264,50 +293,73 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         );
       }
 
-      const startInputEpoch = inputEpoch;
-      try {
-        const decision = await withCompletionAnalysisBudget(
-          (catchupSignal, catchupMs) => background.acquireForeground(catchupMs, catchupSignal),
-          async (completionSignal, releaseForeground) => {
-            try {
-              const binding = await resolveBinding(ctx, false);
-              if (!binding)
-                throw new Error('no eligible different-family Advisor route is available');
-              return analyze(
-                ctx,
-                binding,
-                structuredClone(manager.get()),
-                'completion',
-                `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${sanitizeCrossProvider(String(task.subject ?? ''), 'tool')}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`,
-                await resolveHostContext(ctx, 'completion', false),
-                completionSignal
-              );
-            } finally {
-              releaseForeground();
-            }
-          },
-          ctx.signal
-        );
-        if (startInputEpoch !== inputEpoch) {
-          return reject(
-            `New user input arrived while task #${taskId} was being checked. Keep it active and reconcile the new instruction before retrying completion.`
-          );
-        }
-        if (decision.verdict === 'PASS' && decision.confidence >= 0.7) {
-          manager.clearCompletionReconciliation(taskId);
-          manager.persist();
-          return undefined;
-        }
-        const reason = decision.message?.trim() || decision.reasoning.trim();
-        return reject(
-          completionCorrection(taskId, decision.verdict === 'GAP' ? reason : undefined)
-        );
-      } catch (error) {
-        return reject(completionCorrection(taskId));
+      completionRuntime ??= runtimeSnapshot(ctx.cwd, ctx.model, ctx.getSystemPrompt());
+      const stateSnapshot = structuredClone(manager.get());
+      const taskSnapshot = structuredClone(task) as Record<string, unknown>;
+      const runtime = structuredClone(completionRuntime);
+      const signature = completionSignature(taskId, taskSnapshot, stateSnapshot, runtime);
+      const host = snapshotCompletionContext(ctx, runtime);
+      manager.clearCompletionReconciliation(taskId);
+      manager.persist();
+      const result = completionSemantic.request(
+        signature,
+        async (signal) => {
+          try {
+            return await withCompletionForegroundLease(
+              (catchupSignal, catchupMs) => background.acquireForeground(catchupMs, catchupSignal),
+              async (completionSignal) => {
+                const binding = await options.resolveModel(host);
+                if (completionSignal.aborted) throw new Error('completion analysis aborted');
+                if (!binding)
+                  throw new Error('no eligible different-family Advisor route is available');
+                const hostContext = await resolveHostContext(
+                  host,
+                  'completion',
+                  false,
+                  stateSnapshot
+                );
+                if (completionSignal.aborted) throw new Error('completion analysis aborted');
+                return analyze(
+                  host,
+                  binding,
+                  stateSnapshot,
+                  'completion',
+                  completionRequest(taskId, taskSnapshot),
+                  hostContext,
+                  completionSignal
+                );
+              },
+              signal
+            );
+          } catch (error) {
+            return {
+              verdict: 'UNKNOWN',
+              action: 'continue',
+              reasoning: error instanceof Error ? error.message : String(error),
+              confidence: 0,
+            };
+          }
+        },
+        () => currentCompletionSignature(taskId) === signature,
+        (decision) => emitCompletionResult(taskId, decision)
+      );
+      if (result.kind === 'pass') {
+        manager.clearCompletionReconciliation(taskId);
+        manager.persist();
+        return undefined;
       }
+      if (result.kind === 'gap') {
+        const reason = result.decision.message?.trim() || result.decision.reasoning.trim();
+        return reject(completionCorrection(taskId, reason), false);
+      }
+      return reject(
+        `Task #${taskId} remains active while Advisor verifies the current evidence asynchronously. Continue other work; retry TaskUpdate after Advisor reports the result.`,
+        false
+      );
     };
 
     pi.events.on(TASK_STATE_EVENT, (value: unknown) => {
+      completionSemantic.invalidate();
       const completedTasks = completedTaskTransitions(manager.get().taskState, value);
       const reason =
         value && typeof value === 'object' && 'reason' in value
@@ -340,6 +392,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
 
     pi.on('session_start', (_event, ctx) => {
+      completionSemantic.invalidate();
+      completionRuntime = runtimeSnapshot(ctx.cwd, ctx.model, ctx.getSystemPrompt());
       manager.load(ctx);
       watcher = options.watchContract
         ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
@@ -353,6 +407,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
 
     pi.on('session_tree', (_event, ctx) => {
+      completionSemantic.invalidate();
+      completionRuntime = runtimeSnapshot(ctx.cwd, ctx.model, ctx.getSystemPrompt());
       manager.load(ctx);
       watcher = options.watchContract
         ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
@@ -367,6 +423,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
 
     pi.on('input', (event) => {
       if (event.source !== 'interactive' && event.source !== 'rpc') return;
+      completionSemantic.invalidate();
       inputEpoch++;
       manager.bindTrustedInput(event.text, event.source);
       manager.persist();
@@ -489,6 +546,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     pi.on('tool_call', async (event: ToolCallEvent, ctx) => {
       const completionBlocked = await completionGate(event, ctx);
       if (completionBlocked) return completionBlocked;
+      completionSemantic.invalidate();
       const input = structuredClone(event.input as Record<string, unknown>);
       pendingInputs.set(event.toolCallId, { name: event.toolName, input });
       manager.toolStarted(event.toolCallId, event.toolName, input);
@@ -508,6 +566,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
 
     pi.on('tool_result', async (event: ToolResultEvent, ctx) => {
+      completionSemantic.invalidate();
       const pending = pendingInputs.get(event.toolCallId);
       pendingInputs.delete(event.toolCallId);
       const output = event.content
@@ -568,7 +627,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         ].filter((match) => match.effect === 'remind')
       );
       pendingReminders.delete(event.toolCallId);
-      for (const reminder of reminders) emit(reminderText(reminder), reminder.severity, ctx);
+      for (const reminder of reminders) emit(reminderText(reminder), reminder.severity);
     });
 
     pi.on('agent_settled', async (_event, ctx) => {
@@ -597,7 +656,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       const reconciliation = manager.get().completionReconciliation;
       if (task && reconciliation?.taskId === task.id && !reconciliation.nudged) {
         const message = `Task #${task.id} remains active after a rejected completion: ${reconciliation.reason} Resolve that gap from current evidence and retry TaskUpdate before yielding.`;
-        if (!ctx.hasPendingMessages() && emit(message, 'concern', ctx, true)) {
+        if (!ctx.hasPendingMessages() && emit(message, 'concern', true)) {
           manager.markCompletionReconciliationNudged(task.id);
           manager.persist();
           return;
@@ -625,12 +684,17 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       const wantsContinuation = decision.action === 'continue' || severity === 'blocker';
       const signature = digest(`${decision.verdict}\u0000${message}`);
       if (wantsContinuation && !ctx.hasPendingMessages() && manager.markContinuation(signature))
-        emit(message, severity, ctx, true);
-      else emit(message, severity, ctx);
+        emit(message, severity, true);
+      else emit(message, severity);
     };
 
-    pi.on('session_before_compact', () => manager.persist());
+    pi.on('session_before_compact', () => {
+      completionSemantic.invalidate();
+      manager.persist();
+    });
     pi.on('session_compact', (_event, ctx) => {
+      completionSemantic.invalidate();
+      completionRuntime = runtimeSnapshot(ctx.cwd, ctx.model, ctx.getSystemPrompt());
       manager.load(ctx);
       watcher = options.watchContract
         ? new WatchEngine(options.watchContract, options.matchAst, manager.get().watch)
@@ -643,12 +707,15 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
 
     pi.on('model_select', (_event, ctx) => {
+      completionSemantic.invalidate();
+      completionRuntime = runtimeSnapshot(ctx.cwd, ctx.model, ctx.getSystemPrompt());
       routeLabel = undefined;
       automaticRouteFailure = undefined;
       pendingReminders.clear();
       resetBackground(ctx);
     });
     pi.on('session_shutdown', () => {
+      completionSemantic.invalidate();
       if (watcher) manager.setWatchState(watcher.exportState());
       manager.persist();
       background.reset();
@@ -687,8 +754,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         } catch (error) {
           emit(
             `Advisor question failed: ${error instanceof Error ? error.message : String(error)}`,
-            'concern',
-            ctx
+            'concern'
           );
           return;
         }
@@ -703,8 +769,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
             ? 'concern'
             : decision.verdict === 'UNKNOWN'
               ? 'blocker'
-              : 'nit',
-          ctx
+              : 'nit'
         );
       },
     });
@@ -736,12 +801,13 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     async function resolveHostContext(
       ctx: ExtensionContext,
       mode: AdvisorAnalysisMode,
-      semanticEscalation: boolean
+      semanticEscalation: boolean,
+      state = manager.get()
     ): Promise<string | undefined> {
       if (!options.resolveContext) return undefined;
       try {
         return sanitizeCrossProvider(
-          await options.resolveContext(ctx, manager.get(), mode, semanticEscalation),
+          await options.resolveContext(ctx, state, mode, semanticEscalation),
           'host'
         );
       } catch (error) {
@@ -750,6 +816,34 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           'host'
         );
       }
+    }
+
+    function currentCompletionSignature(taskId: string): string | undefined {
+      const task = taskById(manager.get().taskState, taskId);
+      if (!task || !completionRuntime) return undefined;
+      return completionSignature(taskId, task, manager.get(), completionRuntime);
+    }
+
+    function emitCompletionResult(taskId: string, decision: AdvisorDecision): void {
+      if (decision.verdict === 'PASS' && decision.confidence >= 0.7) {
+        emitCompletionFollowUp(
+          `Task #${taskId} completion verification passed. Retry TaskUpdate status=completed now.`,
+          'nit'
+        );
+        return;
+      }
+      if (decision.verdict === 'GAP') {
+        const reason = decision.message?.trim() || decision.reasoning.trim();
+        emitCompletionFollowUp(
+          `Task #${taskId} completion verification found a remaining gap: ${reason} Continue from that gap, then retry TaskUpdate.`,
+          'concern'
+        );
+        return;
+      }
+      emitCompletionFollowUp(
+        `Task #${taskId} completion verification did not converge. Continue from current evidence or retry TaskUpdate to start a fresh check.`,
+        'concern'
+      );
     }
   };
 }
@@ -927,6 +1021,36 @@ function openTaskBlockers(value: unknown, task: Record<string, any>): string[] {
 
 function rejectCompletion(reason: string): ToolCallEventResult {
   return { block: true, reason };
+}
+
+function completionRequest(taskId: string, task: Record<string, unknown>): string {
+  return `The agent is requesting TaskUpdate status=completed for task #${taskId}: ${sanitizeCrossProvider(String(task.subject ?? ''), 'tool')}. PASS only when the supplied runtime evidence demonstrates the task's stated outcome and acceptance criteria are actually complete. Otherwise identify the single most important missing action or evidence.`;
+}
+
+function completionMetadataSignature(
+  state: ReturnType<AdvisorStateManager['get']>,
+  runtime: CompletionRuntimeSnapshot | undefined
+): string {
+  return digest(
+    JSON.stringify({
+      instructions: state.instructions,
+      plan: state.plan,
+      runtime,
+    })
+  );
+}
+
+function snapshotCompletionContext(
+  ctx: ExtensionContext,
+  runtime: CompletionRuntimeSnapshot
+): ExtensionContext {
+  const systemPrompt = ctx.getSystemPrompt();
+  return Object.freeze({
+    cwd: runtime.cwd,
+    model: ctx.model,
+    modelRegistry: ctx.modelRegistry,
+    getSystemPrompt: () => systemPrompt,
+  }) as ExtensionContext;
 }
 
 function evidenceInput(input: Record<string, unknown>): Record<string, unknown> {

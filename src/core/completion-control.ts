@@ -6,27 +6,29 @@ export class CompletionAnalysisTimeoutError extends Error {
 }
 
 export const COMPLETION_CATCHUP_MS = 3_000;
-export const COMPLETION_ANALYSIS_TIMEOUT_MS = 20_000;
+// The completion gate launches this budget without awaiting it: a short queue
+// catchup phase is followed by an independent medium-model decision window.
+export const COMPLETION_ANALYSIS_TIMEOUT_MS = 60_000;
 
-export async function withCompletionAnalysisBudget<C, T>(
-  catchup: (signal: AbortSignal, catchupMs: number) => Promise<C>,
-  work: (signal: AbortSignal, caught: C) => Promise<T>,
+export async function withCompletionForegroundLease<T>(
+  acquire: (signal: AbortSignal, catchupMs: number) => Promise<() => void>,
+  work: (signal: AbortSignal) => Promise<T>,
   signal?: AbortSignal,
   budgets: { catchupMs: number; timeoutMs: number } = {
     catchupMs: COMPLETION_CATCHUP_MS,
     timeoutMs: COMPLETION_ANALYSIS_TIMEOUT_MS,
   }
 ): Promise<T> {
-  const caught = await withCompletionAnalysisTimeout(
-    (catchupSignal) => catchup(catchupSignal, budgets.catchupMs),
+  const release = await withCompletionAnalysisTimeout(
+    (catchupSignal) => acquire(catchupSignal, budgets.catchupMs),
     budgets.catchupMs,
     signal
   );
-  return withCompletionAnalysisTimeout(
-    (completionSignal) => work(completionSignal, caught),
-    budgets.timeoutMs,
-    signal
-  );
+  try {
+    return await withCompletionAnalysisTimeout(work, budgets.timeoutMs, signal);
+  } finally {
+    release();
+  }
 }
 
 export async function withCompletionAnalysisTimeout<T>(
