@@ -1,6 +1,7 @@
 export type BackgroundBatch<T> = {
   items: T[];
   generation: number;
+  signal: AbortSignal;
 };
 
 type CatchupWaiter = {
@@ -20,11 +21,17 @@ export class IncrementalAdvisorQueue<T> {
   private foregroundTail: Promise<void> = Promise.resolve();
   private generation = 0;
   private waiters = new Set<CatchupWaiter>();
+  private backgroundController: AbortController | undefined;
+  private readonly process: (batch: BackgroundBatch<T>) => Promise<void>;
+  private readonly onBackgroundError: ((error: unknown) => void) | undefined;
 
   constructor(
-    private readonly process: (batch: BackgroundBatch<T>) => Promise<void>,
-    private readonly onBackgroundError?: (error: unknown) => void
-  ) {}
+    process: (batch: BackgroundBatch<T>) => Promise<void>,
+    onBackgroundError?: (error: unknown) => void
+  ) {
+    this.process = process;
+    this.onBackgroundError = onBackgroundError;
+  }
 
   enqueue(item: T): void {
     this.pending.push(item);
@@ -34,6 +41,7 @@ export class IncrementalAdvisorQueue<T> {
   reset(): number {
     this.generation++;
     this.pending = [];
+    this.backgroundController?.abort();
     this.finishWaiters(false);
     return this.generation;
   }
@@ -81,12 +89,17 @@ export class IncrementalAdvisorQueue<T> {
       release();
       throw new Error(`Advisor catch-up exceeded ${Math.round(maxCatchupMs / 1000)} seconds`);
     }
+    this.foreground = true;
+    this.pending = [];
+    this.backgroundController?.abort();
     const remaining = Math.max(0, maxCatchupMs - (Date.now() - startedAt));
     if (!(await this.waitForCatchup(remaining, signal))) {
+      this.foreground = false;
       release();
+      this.notifyCaughtUp();
+      void this.drain();
       throw new Error(`Advisor catch-up exceeded ${Math.round(maxCatchupMs / 1000)} seconds`);
     }
-    this.foreground = true;
     this.busy = true;
     try {
       return await work();
@@ -104,11 +117,19 @@ export class IncrementalAdvisorQueue<T> {
     this.busy = true;
     try {
       while (!this.foreground && this.pending.length > 0) {
-        const batch = { items: this.pending.splice(0), generation: this.generation };
+        const controller = new AbortController();
+        this.backgroundController = controller;
+        const batch = {
+          items: this.pending.splice(0),
+          generation: this.generation,
+          signal: controller.signal,
+        };
         try {
           await this.process(batch);
         } catch (error) {
           this.onBackgroundError?.(error);
+        } finally {
+          if (this.backgroundController === controller) this.backgroundController = undefined;
         }
       }
     } finally {

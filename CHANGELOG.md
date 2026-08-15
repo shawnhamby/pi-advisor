@@ -32,6 +32,8 @@
   boundary rather than later-phase effects.
 - Reconcile a rejected completion once when the agent settles so an active task
   cannot be silently abandoned.
+- Preempt stale automatic analysis when a completion check or direct Advisor
+  question needs the isolated model session.
 
 ## 0.1.0
 

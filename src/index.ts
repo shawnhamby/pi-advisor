@@ -159,11 +159,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     };
 
     const background = new IncrementalAdvisorQueue<BackgroundUpdate>(
-      async ({ items, generation }) => {
+      async ({ items, generation, signal }) => {
         const latest = items.at(-1);
-        if (!latest || !background.isCurrent(generation)) return;
+        if (!latest || signal.aborted || !background.isCurrent(generation)) return;
         const binding = await resolveBinding(latest.ctx, false);
-        if (!binding || !background.isCurrent(generation)) return;
+        if (!binding || signal.aborted || !background.isCurrent(generation)) return;
         const semanticMatches = uniqueMatches(items.flatMap((item) => item.semanticMatches));
         const semanticEscalation = semanticMatches.length > 0;
         const needsHostPrime = needsHostPrimeGeneration === generation;
@@ -171,7 +171,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           needsHostPrime || semanticEscalation
             ? await resolveHostContext(latest.ctx, 'automatic', semanticEscalation)
             : undefined;
-        if (!background.isCurrent(generation)) return;
+        if (signal.aborted || !background.isCurrent(generation)) return;
         const decision = await analyze(
           latest.ctx,
           binding,
@@ -179,10 +179,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           'automatic',
           semanticMatches.length ? semanticPrompt(semanticMatches) : undefined,
           hostContext,
-          undefined,
+          signal,
           coalescedTranscript(items)
         );
-        if (!background.isCurrent(generation) || latest.inputEpoch !== inputEpoch) return;
+        if (signal.aborted || !background.isCurrent(generation) || latest.inputEpoch !== inputEpoch)
+          return;
         if (needsHostPrimeGeneration === generation) needsHostPrimeGeneration = -1;
         manager.markAnalyzed();
         handleBackgroundDecision(
