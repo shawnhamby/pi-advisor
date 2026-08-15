@@ -1,3 +1,5 @@
+import type { AdvisorDecision, AdvisorSeverity, AdvisorState } from '../types.js';
+
 export class CompletionAnalysisTimeoutError extends Error {
   constructor() {
     super('completion analysis timed out');
@@ -5,31 +7,7 @@ export class CompletionAnalysisTimeoutError extends Error {
   }
 }
 
-export const COMPLETION_CATCHUP_MS = 3_000;
-// The completion gate launches this budget without awaiting it: a short queue
-// catchup phase is followed by an independent medium-model decision window.
-export const COMPLETION_ANALYSIS_TIMEOUT_MS = 60_000;
-
-export async function withCompletionForegroundLease<T>(
-  acquire: (signal: AbortSignal, catchupMs: number) => Promise<() => void>,
-  work: (signal: AbortSignal) => Promise<T>,
-  signal?: AbortSignal,
-  budgets: { catchupMs: number; timeoutMs: number } = {
-    catchupMs: COMPLETION_CATCHUP_MS,
-    timeoutMs: COMPLETION_ANALYSIS_TIMEOUT_MS,
-  }
-): Promise<T> {
-  const release = await withCompletionAnalysisTimeout(
-    (catchupSignal) => acquire(catchupSignal, budgets.catchupMs),
-    budgets.catchupMs,
-    signal
-  );
-  try {
-    return await withCompletionAnalysisTimeout(work, budgets.timeoutMs, signal);
-  } finally {
-    release();
-  }
-}
+export const COMPLETION_ANALYSIS_TIMEOUT_MS = 120_000;
 
 export async function withCompletionAnalysisTimeout<T>(
   work: (signal: AbortSignal) => Promise<T>,
@@ -77,6 +55,39 @@ export function completionCorrection(taskId: string, detail?: string): string {
   return `Task #${taskId} remains active because Advisor could not verify completion${detail ? `: ${detail}` : '.'} Continue the work or add concrete evidence, then retry TaskUpdate.`;
 }
 
+export type CompletionEmission = {
+  message: string;
+  severity: AdvisorSeverity;
+  deliverAs: 'followUp';
+  triggerTurn: boolean;
+};
+
+export function completionEmission(taskId: string, decision: AdvisorDecision): CompletionEmission {
+  if (decision.verdict === 'PASS' && decision.confidence >= 0.7) {
+    return {
+      message: `Task #${taskId} completion verification passed. Retry TaskUpdate status=completed now.`,
+      severity: 'nit',
+      deliverAs: 'followUp',
+      triggerTurn: true,
+    };
+  }
+  if (decision.verdict === 'GAP') {
+    const reason = decision.message?.trim() || decision.reasoning.trim();
+    return {
+      message: `Task #${taskId} completion verification found a remaining gap: ${reason} Continue from that gap, then retry TaskUpdate.`,
+      severity: 'concern',
+      deliverAs: 'followUp',
+      triggerTurn: true,
+    };
+  }
+  return {
+    message: `Task #${taskId} completion verification did not converge; the task remains active.`,
+    severity: 'concern',
+    deliverAs: 'followUp',
+    triggerTurn: false,
+  };
+}
+
 export function hasTaskLocalCompletionEvidence(task: Record<string, unknown>): boolean {
   const metadata = task.metadata;
   if (!metadata || typeof metadata !== 'object') return false;
@@ -89,6 +100,22 @@ export function hasTaskLocalCompletionEvidence(task: Record<string, unknown>): b
     const anchored = hasText(entry.line_hash) || hasText(entry.file_hash);
     return hasText(entry.source) && (observed || anchored);
   });
+}
+
+export function hasCompletionEvidence(
+  task: Record<string, unknown>,
+  state: Pick<AdvisorState, 'toolEvidence'>
+): boolean {
+  if (hasTaskLocalCompletionEvidence(task)) return true;
+  const createdAt = typeof task.createdAt === 'number' ? task.createdAt : 0;
+  return state.toolEvidence.some(
+    (evidence) =>
+      evidence.validation === true &&
+      !evidence.isError &&
+      evidence.finishedAt >= createdAt &&
+      hasText(evidence.outputDigest) &&
+      hasText(evidence.outputPreview)
+  );
 }
 
 function hasText(value: unknown): value is string {

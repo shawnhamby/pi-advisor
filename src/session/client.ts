@@ -3,13 +3,38 @@ import type { AdvisorAnalysisMode, AdvisorDecision, AdvisorModelBinding } from '
 import { SupervisorSession } from './supervisor-session.js';
 import { parseDecision, unknown } from './response-parser.js';
 
-let activeSession: SupervisorSession | undefined;
-let activeKey: string | undefined;
+type AdvisorSession = Pick<SupervisorSession, 'dispose' | 'ensureStarted' | 'prompt'>;
+type AdvisorSessionLane = 'standard' | 'completion';
+type AdvisorSessionSlot = { session: AdvisorSession; key: string };
+
+export class AdvisorSessionLanes {
+  private readonly slots: Partial<Record<AdvisorSessionLane, AdvisorSessionSlot>> = {};
+
+  constructor(
+    private readonly createSession: () => AdvisorSession = () => new SupervisorSession()
+  ) {}
+
+  session(mode: AdvisorAnalysisMode, key: string): AdvisorSession {
+    const lane = mode === 'completion' ? 'completion' : 'standard';
+    const current = this.slots[lane];
+    if (lane === 'standard' && current?.key === key) return current.session;
+    current?.session.dispose();
+    const session = this.createSession();
+    this.slots[lane] = { session, key };
+    return session;
+  }
+
+  dispose(): void {
+    for (const slot of Object.values(this.slots)) slot?.session.dispose();
+    delete this.slots.standard;
+    delete this.slots.completion;
+  }
+}
+
+const activeSessions = new AdvisorSessionLanes();
 
 export function disposeAdvisorSession(): void {
-  activeSession?.dispose();
-  activeSession = undefined;
-  activeKey = undefined;
+  activeSessions.dispose();
 }
 
 export async function callAdvisorModel(
@@ -22,12 +47,8 @@ export async function callAdvisorModel(
 ): Promise<AdvisorDecision> {
   const toolsEnabled = advisorSessionToolsEnabled(mode);
   const key = `${ctx.cwd}\u0000${binding.provider}\u0000${binding.modelId}\u0000${binding.effort}\u0000${toolsEnabled}`;
-  if (!activeSession || activeKey !== key) {
-    disposeAdvisorSession();
-    activeSession = new SupervisorSession();
-    activeKey = key;
-  }
-  const started = await activeSession.ensureStarted(
+  const session = activeSessions.session(mode, key);
+  const started = await session.ensureStarted(
     ctx,
     binding.provider,
     binding.modelId,
@@ -36,7 +57,7 @@ export async function callAdvisorModel(
     toolsEnabled
   );
   if (!started) return unknown('advisor model session could not start');
-  const text = await activeSession.prompt(userPrompt, signal);
+  const text = await session.prompt(userPrompt, signal);
   return text === null ? unknown('advisor model call failed') : parseDecision(text);
 }
 

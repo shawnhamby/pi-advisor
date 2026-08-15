@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   CompletionAnalysisTimeoutError,
+  completionEmission,
   completionCorrection,
+  hasCompletionEvidence,
   hasTaskLocalCompletionEvidence,
   reconcileActiveTools,
-  withCompletionForegroundLease,
   withCompletionAnalysisTimeout,
 } from '../src/core/completion-control.ts';
 
@@ -48,57 +49,32 @@ test('completion analysis clears its timeout after ordinary completion', async (
   assert.equal(aborted, false);
 });
 
-test('detached completion uses independent catchup and 60s decision budgets and releases once', async () => {
-  let releaseCount = 0;
-  let observedCatchupMs = 0;
-  const result = await withCompletionForegroundLease(
-    async (_signal, catchupMs) => {
-      observedCatchupMs = catchupMs;
-      return () => releaseCount++;
-    },
-    async () => 'PASS',
-    undefined,
-    { catchupMs: 3_000, timeoutMs: 60_000 }
-  );
-
-  assert.equal(result, 'PASS');
-  assert.equal(observedCatchupMs, 3_000);
-  assert.equal(releaseCount, 1);
-
-  await assert.rejects(
-    withCompletionForegroundLease(
-      async () => () => releaseCount++,
-      async () => new Promise<never>(() => {}),
-      undefined,
-      { catchupMs: 20, timeoutMs: 10 }
-    ),
-    CompletionAnalysisTimeoutError
-  );
-  assert.equal(releaseCount, 2);
-
-  const parent = new AbortController();
-  let decisionAborted = false;
-  let markStarted!: () => void;
-  const started = new Promise<void>((resolve) => {
-    markStarted = resolve;
+test('completion result delivery triggers only actionable PASS and GAP decisions', () => {
+  const pass = completionEmission('1', {
+    verdict: 'PASS',
+    action: 'silent',
+    reasoning: 'verified',
+    confidence: 0.9,
   });
-  const cancelled = withCompletionForegroundLease(
-    async () => () => releaseCount++,
-    (signal) =>
-      new Promise<never>(() => {
-        markStarted();
-        signal.addEventListener('abort', () => {
-          decisionAborted = true;
-        });
-      }),
-    parent.signal,
-    { catchupMs: 50, timeoutMs: 50 }
-  );
-  await started;
-  parent.abort();
-  await assert.rejects(cancelled);
-  assert.equal(decisionAborted, true);
-  assert.equal(releaseCount, 3);
+  const gap = completionEmission('1', {
+    verdict: 'GAP',
+    action: 'continue',
+    message: 'one check remains',
+    reasoning: 'missing check',
+    confidence: 0.9,
+  });
+  const unknown = completionEmission('1', {
+    verdict: 'UNKNOWN',
+    action: 'continue',
+    reasoning: 'provider timed out',
+    confidence: 0,
+  });
+
+  assert.equal(pass.triggerTurn, true);
+  assert.equal(gap.triggerTurn, true);
+  assert.equal(unknown.deliverAs, 'followUp');
+  assert.equal(unknown.triggerTurn, false);
+  assert.doesNotMatch(unknown.message, /retry|continue/i);
 });
 
 test('active-tool reconciliation removes terminal entries and preserves live work', () => {
@@ -160,6 +136,44 @@ test('completion recognizes deployed task-local evidence object and array shapes
   assert.equal(
     hasTaskLocalCompletionEvidence({
       metadata: { evidence: { kind: 'validation-output', claim: 'done' } },
+    }),
+    false
+  );
+});
+
+test('completion can enter semantic review from observed validation evidence', () => {
+  const task = { id: '1', createdAt: 100, metadata: {} };
+  assert.equal(
+    hasCompletionEvidence(task, {
+      toolEvidence: [
+        {
+          toolCallId: 'check-1',
+          toolName: 'bash',
+          input: { command: 'npm test' },
+          validation: true,
+          isError: false,
+          outputDigest: 'abc123',
+          outputPreview: 'tests passed',
+          finishedAt: 101,
+        },
+      ],
+    }),
+    true
+  );
+  assert.equal(
+    hasCompletionEvidence(task, {
+      toolEvidence: [
+        {
+          toolCallId: 'read-1',
+          toolName: 'read',
+          input: {},
+          validation: false,
+          isError: false,
+          outputDigest: 'abc123',
+          outputPreview: 'looks done',
+          finishedAt: 101,
+        },
+      ],
     }),
     false
   );

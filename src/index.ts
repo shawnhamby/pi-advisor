@@ -14,10 +14,12 @@ import { Container, Text } from '@earendil-works/pi-tui';
 import { analyze } from './core/analyzer.js';
 import { IncrementalAdvisorQueue } from './core/background-queue.js';
 import {
+  COMPLETION_ANALYSIS_TIMEOUT_MS,
+  completionEmission,
   completionCorrection,
-  hasTaskLocalCompletionEvidence,
+  hasCompletionEvidence,
   reconcileActiveTools,
-  withCompletionForegroundLease,
+  withCompletionAnalysisTimeout,
 } from './core/completion-control.js';
 import {
   CompletionSemanticCache,
@@ -131,7 +133,12 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       return true;
     };
 
-    const emitCompletionFollowUp = (message: string, severity: AdvisorSeverity): void => {
+    const emitCompletionMessage = (
+      message: string,
+      severity: AdvisorSeverity,
+      deliverAs: 'followUp',
+      triggerTurn: boolean
+    ): void => {
       const trimmed = message.trim();
       if (!trimmed) return;
       pi.sendMessage(
@@ -146,7 +153,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
             agentAttributed: true,
           },
         },
-        { deliverAs: 'followUp', triggerTurn: true }
+        { deliverAs, triggerTurn }
       );
     };
 
@@ -283,8 +290,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
           `Task #${taskId} is still blocked by ${blockers.map((id) => `#${id}`).join(', ')}. Resolve those tasks before retrying completion.`
         );
       }
-      if (!hasTaskLocalCompletionEvidence(task)) {
-        return reject(completionCorrection(taskId, 'task-local concrete evidence is missing'));
+      if (!hasCompletionEvidence(task, manager.get())) {
+        return reject(completionCorrection(taskId, 'observed completion evidence is missing'));
       }
       const activeToolIds = reconcileActiveTools(manager.get().activeTools, pendingInputs.keys());
       if (activeToolIds.length > 0) {
@@ -305,8 +312,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         signature,
         async (signal) => {
           try {
-            return await withCompletionForegroundLease(
-              (catchupSignal, catchupMs) => background.acquireForeground(catchupMs, catchupSignal),
+            return await withCompletionAnalysisTimeout(
               async (completionSignal) => {
                 const binding = await options.resolveModel(host);
                 if (completionSignal.aborted) throw new Error('completion analysis aborted');
@@ -329,6 +335,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
                   completionSignal
                 );
               },
+              COMPLETION_ANALYSIS_TIMEOUT_MS,
               signal
             );
           } catch (error) {
@@ -352,8 +359,20 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         const reason = result.decision.message?.trim() || result.decision.reasoning.trim();
         return reject(completionCorrection(taskId, reason), false);
       }
+      if (result.kind === 'cooldown') {
+        return reject(
+          `Task #${taskId} remains active because Advisor completion verification is temporarily unavailable. Do not retry TaskUpdate until the task evidence changes.`,
+          false
+        );
+      }
+      if (!result.started) {
+        return reject(
+          `Task #${taskId} remains active while Advisor verification is already running. Do not retry TaskUpdate until Advisor reports the result.`,
+          false
+        );
+      }
       return reject(
-        `Task #${taskId} remains active while Advisor verifies the current evidence asynchronously. Continue other work; retry TaskUpdate after Advisor reports the result.`,
+        `Task #${taskId} remains active while Advisor verifies the current evidence asynchronously. Continue other work; Advisor will report the result.`,
         false
       );
     };
@@ -829,24 +848,12 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     }
 
     function emitCompletionResult(taskId: string, decision: AdvisorDecision): void {
-      if (decision.verdict === 'PASS' && decision.confidence >= 0.7) {
-        emitCompletionFollowUp(
-          `Task #${taskId} completion verification passed. Retry TaskUpdate status=completed now.`,
-          'nit'
-        );
-        return;
-      }
-      if (decision.verdict === 'GAP') {
-        const reason = decision.message?.trim() || decision.reasoning.trim();
-        emitCompletionFollowUp(
-          `Task #${taskId} completion verification found a remaining gap: ${reason} Continue from that gap, then retry TaskUpdate.`,
-          'concern'
-        );
-        return;
-      }
-      emitCompletionFollowUp(
-        `Task #${taskId} completion verification did not converge. Continue from current evidence or retry TaskUpdate to start a fresh check.`,
-        'concern'
+      const emission = completionEmission(taskId, decision);
+      emitCompletionMessage(
+        emission.message,
+        emission.severity,
+        emission.deliverAs,
+        emission.triggerTurn
       );
     }
   };

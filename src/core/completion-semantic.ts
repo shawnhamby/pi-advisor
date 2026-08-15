@@ -11,6 +11,7 @@ export type CompletionRuntimeSnapshot = {
 export type CompletionCacheResult =
   | { kind: 'pass' }
   | { kind: 'gap'; decision: AdvisorDecision }
+  | { kind: 'cooldown'; decision: AdvisorDecision }
   | { kind: 'pending'; started: boolean };
 
 type RunningEntry = {
@@ -20,7 +21,7 @@ type RunningEntry = {
 };
 
 type SettledEntry = {
-  kind: 'pass' | 'gap';
+  kind: 'pass' | 'gap' | 'cooldown';
   generation: number;
   decision: AdvisorDecision;
   settledAt: number;
@@ -31,10 +32,12 @@ type CompletionEntry = RunningEntry | SettledEntry;
 export class CompletionSemanticCache {
   private generation = 0;
   private readonly entries = new Map<string, CompletionEntry>();
+  private running: { signature: string; entry: RunningEntry } | undefined;
 
   constructor(
     private readonly passTtlMs = COMPLETION_PASS_TTL_MS,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly cooldownMs = COMPLETION_UNKNOWN_COOLDOWN_MS
   ) {}
 
   request(
@@ -43,26 +46,37 @@ export class CompletionSemanticCache {
     stillCurrent: () => boolean,
     onSettled: (decision: AdvisorDecision) => void
   ): CompletionCacheResult {
-    const existing = this.entries.get(signature);
-    if (existing?.kind === 'pass') {
-      if (this.now() - existing.settledAt > this.passTtlMs) {
+    let existing = this.entries.get(signature);
+    if (existing?.kind === 'pass' || existing?.kind === 'cooldown') {
+      const ttl = existing.kind === 'pass' ? this.passTtlMs : this.cooldownMs;
+      if (this.now() - existing.settledAt > ttl) {
         this.entries.delete(signature);
+        existing = undefined;
       } else {
-        this.entries.delete(signature);
-        return { kind: 'pass' };
+        if (existing.kind === 'pass') {
+          this.entries.delete(signature);
+          return { kind: 'pass' };
+        }
+        return { kind: 'cooldown', decision: existing.decision };
       }
     }
-    const current = this.entries.get(signature);
-    if (current?.kind === 'gap') return { kind: 'gap', decision: current.decision };
-    if (current?.kind === 'running') return { kind: 'pending', started: false };
+    if (existing?.kind === 'gap') return { kind: 'gap', decision: existing.decision };
+    if (this.running?.signature === signature) return { kind: 'pending', started: false };
+    if (this.running) {
+      this.running.entry.controller.abort();
+      this.entries.delete(this.running.signature);
+      this.running = undefined;
+    }
 
     const generation = this.generation;
     const controller = new AbortController();
     const entry: RunningEntry = { kind: 'running', generation, controller };
     this.entries.set(signature, entry);
+    this.running = { signature, entry };
     void run(controller.signal).then(
       (decision) => {
         if (!this.isCurrent(signature, entry)) return;
+        this.running = undefined;
         if (!stillCurrent()) {
           this.entries.delete(signature);
           return;
@@ -82,12 +96,19 @@ export class CompletionSemanticCache {
             settledAt: this.now(),
           });
         } else {
-          this.entries.delete(signature);
+          this.entries.set(signature, {
+            kind: 'cooldown',
+            generation,
+            decision,
+            settledAt: this.now(),
+          });
         }
         onSettled(decision);
       },
       () => {
-        if (this.isCurrent(signature, entry)) this.entries.delete(signature);
+        if (!this.isCurrent(signature, entry)) return;
+        this.running = undefined;
+        this.entries.delete(signature);
       }
     );
     return { kind: 'pending', started: true };
@@ -95,9 +116,8 @@ export class CompletionSemanticCache {
 
   invalidate(): void {
     this.generation++;
-    for (const entry of this.entries.values()) {
-      if (entry.kind === 'running') entry.controller.abort();
-    }
+    this.running?.entry.controller.abort();
+    this.running = undefined;
     this.entries.clear();
   }
 
@@ -112,6 +132,7 @@ export class CompletionSemanticCache {
 }
 
 export const COMPLETION_PASS_TTL_MS = 60_000;
+export const COMPLETION_UNKNOWN_COOLDOWN_MS = 60_000;
 
 /**
  * Successful observation tools do not change the completion facts captured at

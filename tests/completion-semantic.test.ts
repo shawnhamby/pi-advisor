@@ -86,7 +86,7 @@ test('a PASS permit expires after 60 seconds', async () => {
   assert.equal(runs, 2);
 });
 
-test('a matching GAP is sticky while UNKNOWN can be retried', async () => {
+test('a matching GAP is sticky while UNKNOWN enters a 60 second cooldown', async () => {
   const gapCache = new CompletionSemanticCache();
   let gapRuns = 0;
   ask(
@@ -106,13 +106,86 @@ test('a matching GAP is sticky while UNKNOWN can be retried', async () => {
   assert.equal(secondGap.kind, 'gap');
   assert.equal(gapRuns, 1);
 
-  const unknownCache = new CompletionSemanticCache();
+  let now = 1_000;
+  const unknownCache = new CompletionSemanticCache(60_000, () => now);
   let unknownRuns = 0;
   const run = async () => (++unknownRuns === 1 ? UNKNOWN : PASS);
   ask(unknownCache, 'unknown', run);
   await tick();
+  assert.equal(ask(unknownCache, 'unknown', run).kind, 'cooldown');
+  assert.equal(unknownRuns, 1);
+  now += 60_001;
   assert.deepEqual(ask(unknownCache, 'unknown', run), { kind: 'pending', started: true });
   assert.equal(unknownRuns, 2);
+});
+
+test('a newer different signature preempts the sole running completion check', async () => {
+  const cache = new CompletionSemanticCache();
+  const first = deferred<AdvisorDecision>();
+  const second = deferred<AdvisorDecision>();
+  let firstAborted = false;
+  let firstFollowUps = 0;
+  let secondFollowUps = 0;
+
+  ask(
+    cache,
+    'first',
+    (signal) => {
+      signal.addEventListener('abort', () => {
+        firstAborted = true;
+      });
+      return first.promise;
+    },
+    () => true,
+    () => firstFollowUps++
+  );
+  assert.deepEqual(
+    ask(
+      cache,
+      'second',
+      () => second.promise,
+      () => true,
+      () => secondFollowUps++
+    ),
+    { kind: 'pending', started: true }
+  );
+  assert.equal(firstAborted, true);
+
+  first.resolve(PASS);
+  second.resolve(PASS);
+  await tick();
+  assert.equal(firstFollowUps, 0);
+  assert.equal(secondFollowUps, 1);
+  assert.deepEqual(
+    ask(cache, 'second', async () => UNKNOWN),
+    { kind: 'pass' }
+  );
+});
+
+test('state invalidation clears UNKNOWN cooldown and suppresses its stale generation', async () => {
+  const cache = new CompletionSemanticCache();
+  let runs = 0;
+  ask(cache, 'same', async () => {
+    runs++;
+    return UNKNOWN;
+  });
+  await tick();
+  assert.equal(ask(cache, 'same', async () => PASS).kind, 'cooldown');
+
+  cache.invalidate();
+  assert.deepEqual(
+    ask(cache, 'same', async () => {
+      runs++;
+      return PASS;
+    }),
+    { kind: 'pending', started: true }
+  );
+  await tick();
+  assert.equal(runs, 2);
+  assert.deepEqual(
+    ask(cache, 'same', async () => UNKNOWN),
+    { kind: 'pass' }
+  );
 });
 
 test('invalidation aborts work and suppresses late cache and follow-up', async () => {

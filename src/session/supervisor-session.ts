@@ -21,6 +21,9 @@ export class SupervisorSession {
   private model: any = null;
   private systemPrompt: string = '';
   private toolsEnabled: boolean | null = null;
+  private startupGeneration = 0;
+
+  constructor(private readonly createSession: typeof createAgentSession = createAgentSession) {}
 
   async ensureStarted(
     ctx: ExtensionContext,
@@ -44,8 +47,8 @@ export class SupervisorSession {
       return true;
     }
 
-    // Dispose old session if exists
     this.dispose();
+    const generation = this.startupGeneration;
 
     const loader = new DefaultResourceLoader({
       cwd: ctx.cwd,
@@ -57,9 +60,10 @@ export class SupervisorSession {
       systemPromptOverride: () => systemPrompt,
     });
     await loader.reload();
+    if (generation !== this.startupGeneration) return false;
 
     try {
-      const result = await createAgentSession({
+      const result = await this.createSession({
         cwd: ctx.cwd,
         sessionManager: SessionManager.inMemory(),
         agentDir: getAgentDir(),
@@ -69,6 +73,10 @@ export class SupervisorSession {
         customTools: toolsEnabled ? advisorTools(ctx.cwd) : [],
         resourceLoader: loader,
       });
+      if (generation !== this.startupGeneration) {
+        result.session.dispose();
+        return false;
+      }
       this.session = result.session;
       this.model = newModel;
       this.systemPrompt = systemPrompt;
@@ -124,6 +132,7 @@ export class SupervisorSession {
   }
 
   dispose(): void {
+    this.startupGeneration++;
     if (this.session) {
       this.session.dispose();
       this.session = null;
