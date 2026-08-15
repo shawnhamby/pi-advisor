@@ -5,6 +5,24 @@ export class CompletionAnalysisTimeoutError extends Error {
   }
 }
 
+export const COMPLETION_CATCHUP_MS = 3_000;
+export const COMPLETION_ANALYSIS_TIMEOUT_MS = 20_000;
+
+export async function withCompletionAnalysisBudget<T>(
+  work: (signal: AbortSignal, catchupMs: number) => Promise<T>,
+  signal?: AbortSignal,
+  budgets: { catchupMs: number; timeoutMs: number } = {
+    catchupMs: COMPLETION_CATCHUP_MS,
+    timeoutMs: COMPLETION_ANALYSIS_TIMEOUT_MS,
+  }
+): Promise<T> {
+  return withCompletionAnalysisTimeout(
+    (completionSignal) => work(completionSignal, budgets.catchupMs),
+    budgets.catchupMs + budgets.timeoutMs,
+    signal
+  );
+}
+
 export async function withCompletionAnalysisTimeout<T>(
   work: (signal: AbortSignal) => Promise<T>,
   timeoutMs: number,

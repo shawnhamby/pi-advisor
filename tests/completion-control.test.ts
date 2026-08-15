@@ -4,6 +4,7 @@ import {
   CompletionAnalysisTimeoutError,
   completionCorrection,
   reconcileActiveTools,
+  withCompletionAnalysisBudget,
   withCompletionAnalysisTimeout,
 } from '../src/core/completion-control.ts';
 
@@ -44,6 +45,32 @@ test('completion analysis clears its timeout after ordinary completion', async (
 
   assert.equal(result, 'PASS');
   assert.equal(aborted, false);
+});
+
+test('completion analysis receives its decision budget after catchup and remains bounded', async () => {
+  const result = await withCompletionAnalysisBudget(
+    async (_signal, catchupMs) => {
+      assert.equal(catchupMs, 30);
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      return 'PASS';
+    },
+    undefined,
+    { catchupMs: 30, timeoutMs: 20 }
+  );
+
+  assert.equal(result, 'PASS');
+
+  await assert.rejects(
+    withCompletionAnalysisBudget(
+      async () => {
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        return 'late';
+      },
+      undefined,
+      { catchupMs: 30, timeoutMs: 20 }
+    ),
+    CompletionAnalysisTimeoutError
+  );
 });
 
 test('active-tool reconciliation removes terminal entries and preserves live work', () => {

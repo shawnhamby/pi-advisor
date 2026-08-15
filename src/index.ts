@@ -16,7 +16,7 @@ import { IncrementalAdvisorQueue } from './core/background-queue.js';
 import {
   completionCorrection,
   reconcileActiveTools,
-  withCompletionAnalysisTimeout,
+  withCompletionAnalysisBudget,
 } from './core/completion-control.js';
 import {
   redactCrossProviderSecrets,
@@ -45,7 +45,6 @@ const CONTINUITY_EVENT = 'pi-advisor:continuity-restored';
 const EVIDENCE_PREVIEW_LIMIT = 720;
 const EVIDENCE_PREVIEW_HEAD = 200;
 const ADVISOR_CATCHUP_MS = 30_000;
-const COMPLETION_ANALYSIS_TIMEOUT_MS = 10_000;
 const HIGH_SIGNAL_TOOLS =
   /^(?:bash|exec|edit|write|TaskCreate|TaskUpdate|task_plan|task_update|task_evidence|task_complete|spawn_agent|create_thread)$/i;
 const MUTATION_TOOLS = /^(?:edit|write|patch|apply_patch|delete|rename|move|readSeek_rename)$/i;
@@ -263,8 +262,8 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
 
       const startInputEpoch = inputEpoch;
       try {
-        const decision = await withCompletionAnalysisTimeout(
-          (completionSignal) =>
+        const decision = await withCompletionAnalysisBudget(
+          (completionSignal, catchupMs) =>
             background.runForeground(
               async () => {
                 const binding = await resolveBinding(ctx, false);
@@ -280,10 +279,9 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
                   completionSignal
                 );
               },
-              COMPLETION_ANALYSIS_TIMEOUT_MS,
+              catchupMs,
               completionSignal
             ),
-          COMPLETION_ANALYSIS_TIMEOUT_MS,
           ctx.signal
         );
         if (startInputEpoch !== inputEpoch) {
