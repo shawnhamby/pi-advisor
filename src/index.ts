@@ -33,6 +33,7 @@ import {
 } from './core/cross-provider-sanitizer.js';
 import { AdvisorEmissionGuard } from './core/emission-guard.js';
 import { TranscriptDeltaRecorder } from './core/transcript-delta.js';
+import { captureTrustedInput } from './core/trusted-input-capture.js';
 import { disposeAdvisorSession } from './session/client.js';
 import { activeTask, AdvisorStateManager } from './state/manager.js';
 import type {
@@ -440,12 +441,20 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       resetBackground(ctx);
     });
 
-    pi.on('input', (event) => {
-      if (event.source !== 'interactive' && event.source !== 'rpc') return;
-      completionSemantic.invalidate();
-      inputEpoch++;
-      manager.bindTrustedInput(event.text, event.source);
-      manager.persist();
+    pi.on('input', async (event, ctx) => {
+      const source = event.source;
+      if (source !== 'interactive' && source !== 'rpc') return;
+      await captureTrustedInput({
+        accept: options.acceptTrustedInput,
+        event,
+        ctx,
+        capture: () => {
+          completionSemantic.invalidate();
+          inputEpoch++;
+          manager.bindTrustedInput(event.text, source);
+          manager.persist();
+        },
+      });
     });
 
     pi.on('before_agent_start', async (event, ctx) => {

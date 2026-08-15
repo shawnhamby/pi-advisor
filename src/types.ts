@@ -1,4 +1,4 @@
-import type { ExtensionContext } from '@earendil-works/pi-coding-agent';
+import type { ExtensionContext, InputEvent } from '@earendil-works/pi-coding-agent';
 import type {
   AstMatcher,
   ToolSnapshot,
@@ -81,6 +81,7 @@ export type AdvisorAnalysisMode = 'automatic' | 'completion' | 'question';
 
 export type AdvisorHostOptions = {
   resolveModel(ctx: ExtensionContext): Promise<AdvisorModelBinding | undefined>;
+  acceptTrustedInput?(event: InputEvent, ctx: ExtensionContext): boolean | Promise<boolean>;
   resolveContext?(
     ctx: ExtensionContext,
     state: AdvisorState,
