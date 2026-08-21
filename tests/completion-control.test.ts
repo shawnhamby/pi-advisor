@@ -9,6 +9,7 @@ import {
   planSettledCompletionActions,
   reconcileActiveTools,
   shouldResumeBoundWork,
+  takeRelatedMapValues,
   toolCallIdsRelated,
   withCompletionAnalysisTimeout,
 } from '../src/core/completion-control.ts';
@@ -109,6 +110,15 @@ test('related tool ids match composite provider suffixes', () => {
   );
   assert.equal(toolCallIdsRelated('call_a', 'call_a|fc_1'), true);
   assert.equal(toolCallIdsRelated('call_a|fc_1', 'call_b|fc_2'), false);
+});
+
+test('related map lookup consumes composite aliases', () => {
+  const reminders = new Map([
+    ['call_a', ['start']],
+    ['call_b|fc_2', ['other']],
+  ]);
+  assert.deepEqual(takeRelatedMapValues(reminders, 'call_a|fc_1'), [['start']]);
+  assert.deepEqual([...reminders.keys()], ['call_b|fc_2']);
 });
 
 test('bound-work resume requires an objective, no live tools, and no pending input', () => {

@@ -77,6 +77,18 @@ export function toolCallIdsRelated(left: string, right: string): boolean {
   return leftParts.some((part) => rightParts.includes(part));
 }
 
+export function takeRelatedMapValues<T>(store: Map<string, T>, id: string): T[] {
+  const values: T[] = [];
+  for (const key of [...store.keys()]) {
+    if (key === id || toolCallIdsRelated(key, id)) {
+      const value = store.get(key);
+      if (value !== undefined) values.push(value);
+      store.delete(key);
+    }
+  }
+  return values;
+}
+
 export const ABANDON_UNVERIFIED_TASK_EVENT = 'pi-advisor:abandon-unverified-task';
 
 export type { CompletionRejectKind };

@@ -3,7 +3,8 @@
 ## Unreleased
 
 - Reconcile `activeTools` against live pending tool ids at `tool_result` and `agent_settled`, including composite provider ids, so a finished call cannot look in-flight.
-- After settle, if bound work remains, no messages are queued, and no tools are live, emit one follow-up continuation per trusted-input epoch instead of leaving the agent idle.
+- After settle, if bound work remains, no messages are queued, and no tools are live, emit one follow-up continuation per trusted-input epoch instead of leaving the agent idle. A second continuation in the same epoch is refused even when the signature differs.
+- Match composite tool-call ids when collecting pending reminders so a start-id reminder is not dropped on a suffixed result id.
 - Abandon a missing-evidence `TaskUpdate status=completed` at `agent_settled` or shutdown instead of leaving the task open, including when evidence appeared later without a successful complete. Track every rejected task, not only the current `in_progress` one, and emit `pi-advisor:abandon-unverified-task` for pi-tasks to delete it.
 - Abandon completions whose isolated verification does not converge (`unavailable` / async UNKNOWN). A live leftover-4a complete stayed `in_progress` after "verifies asynchronously" plus "did not converge" because that path never tagged settle-abandon.
 - Emit abandon on the rejected `TaskUpdate` itself, and flush at the start of `agent_settled`, so a hung widget does not wait on a later settle that `/reload` in a long-lived Pi process may never run with new code.

@@ -22,6 +22,7 @@ import {
   planSettledCompletionActions,
   reconcileActiveTools,
   shouldResumeBoundWork,
+  takeRelatedMapValues,
   toolCallIdsRelated,
   withCompletionAnalysisTimeout,
 } from './core/completion-control.js';
@@ -654,16 +655,12 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
 
     pi.on('tool_result', async (event: ToolResultEvent, ctx) => {
-      const pending = pendingInputs.get(event.toolCallId);
+      const pending = takeRelatedMapValues(pendingInputs, event.toolCallId)[0];
       completionSemantic.invalidateForTool(
         event.toolName,
         pending?.input ?? event.input,
         event.isError
       );
-      pendingInputs.delete(event.toolCallId);
-      for (const id of [...pendingInputs.keys()]) {
-        if (toolCallIdsRelated(id, event.toolCallId)) pendingInputs.delete(id);
-      }
       const output = event.content
         .map((item) => (item.type === 'text' ? item.text : `[${item.type}]`))
         .join('\n');
@@ -720,12 +717,11 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       }
       const reminders = uniqueMatches(
         [
-          ...(pendingReminders.get(event.toolCallId) ?? []),
+          ...takeRelatedMapValues(pendingReminders, event.toolCallId).flat(),
           ...resultMatches,
           ...snapshotMatches,
         ].filter((match) => match.effect === 'remind')
       );
-      pendingReminders.delete(event.toolCallId);
       for (const reminder of reminders) emit(reminderText(reminder), reminder.severity);
     });
 

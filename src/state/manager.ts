@@ -210,7 +210,7 @@ export class AdvisorStateManager {
   }
 
   markContinuation(signature: string): boolean {
-    if (this.state.continuationIssuedFor === signature) return false;
+    if (this.state.continuationIssuedFor) return false;
     this.state.continuationIssuedFor = signature;
     this.persist();
     return true;
