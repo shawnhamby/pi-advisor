@@ -13,7 +13,9 @@ bounded, role-aware snapshots and changing the authority model:
 - agent-requested task completion is checked before `TaskUpdate` can mark it complete;
 - an unsupported completion attempt returns one corrective tool error without terminating or pausing the agent;
 - completion checks judge prerequisites at the tool's transition boundary rather than requiring effects that can occur only after the transition;
-- a rejected completion is reconciled once at the next settled boundary so an active task cannot be silently abandoned;
+- a rejected completion is tracked per task, independent of `in_progress`;
+- a missing-evidence completion that is still open at the next settled boundary is abandoned through `pi-advisor:abandon-unverified-task` so the widget cannot hang;
+- other rejected completions are still nudged once at settle so remaining work is not silently dropped;
 - direct user completion through `/tasks` remains user-authoritative and is reconciled after the transition;
 - messages are tagged Pi custom messages and never replay trusted user input;
 - an OMP-derived deterministic watch lane observes bounded text, thinking,
@@ -74,10 +76,13 @@ The Advisor does not perform work, grant user authority, formally accept a
 change, create project configuration, discover project prompt files, scan for
 child processes, stop or restart sessions, block execution tools, mutate task
 state, or maintain a second compaction summary. Its only gate is an agent's
-`TaskUpdate status=completed` request; rejection keeps the task active and the
-agent running. Shared hooks retain security and authorization enforcement. The
-public package ships no policy rule pack and does not discover
-repository-controlled rules. A host must admit its own watch contract.
+`TaskUpdate status=completed` request; rejection keeps the agent running.
+A missing-evidence complete that the agent does not substantiate before
+settling is abandoned rather than left hanging. User `/tasks` transitions
+remain authoritative. Shared hooks retain security and authorization
+enforcement. The public package ships no policy rule pack and does not
+discover repository-controlled rules. A host must admit its own watch
+contract.
 
 ## Development
 

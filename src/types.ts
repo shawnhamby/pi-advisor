@@ -10,6 +10,13 @@ import type {
 
 export type AdvisorSeverity = 'nit' | 'concern' | 'blocker';
 
+export type CompletionRejectKind =
+  | 'missing-evidence'
+  | 'gap'
+  | 'blocked'
+  | 'active-tools'
+  | 'unavailable';
+
 export type AdvisorModelBinding = {
   selector: string;
   provider: string;
@@ -61,11 +68,14 @@ export type AdvisorState = {
   pendingContinuity?: boolean;
   watch?: WatchEngineState;
   pendingSemanticMatches?: WatchMatch[];
-  completionReconciliation?: {
-    taskId: string;
-    reason: string;
-    nudged: boolean;
-  };
+  completionReconciliations?: Record<
+    string,
+    {
+      reason: string;
+      kind: CompletionRejectKind;
+      nudged: boolean;
+    }
+  >;
 };
 
 export type AdvisorDecision = {

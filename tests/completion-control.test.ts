@@ -6,6 +6,7 @@ import {
   completionCorrection,
   hasCompletionEvidence,
   hasTaskLocalCompletionEvidence,
+  planSettledCompletionActions,
   reconcileActiveTools,
   withCompletionAnalysisTimeout,
 } from '../src/core/completion-control.ts';
@@ -94,6 +95,10 @@ test('missing completion evidence returns ordinary corrective feedback', () => {
     completionCorrection('16'),
     'Task #16 remains active because Advisor could not verify completion. Continue the work or add concrete evidence, then retry TaskUpdate.'
   );
+  assert.match(
+    completionCorrection('16', 'observed completion evidence is missing', true),
+    /TaskUpdate status=deleted/
+  );
 });
 
 test('completion recognizes deployed task-local evidence object and array shapes', () => {
@@ -177,4 +182,88 @@ test('completion can enter semantic review from observed validation evidence', (
     }),
     false
   );
+});
+
+test('settled unverified completes abandon missing-evidence tasks and keep gaps', () => {
+  const cases = [
+    {
+      name: 'pending probe without evidence is abandoned',
+      reconciliations: {
+        '1': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
+      },
+      tasks: { '1': { id: '1', status: 'pending' } },
+      evidence: new Set<string>(),
+      abandon: ['1'],
+      nudge: [] as string[],
+      drop: [] as string[],
+    },
+    {
+      name: 'second pending probe is abandoned with the first',
+      reconciliations: {
+        '1': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
+        '2': { reason: 'missing', kind: 'missing-evidence' as const, nudged: true },
+      },
+      tasks: {
+        '1': { id: '1', status: 'pending' },
+        '2': { id: '2', status: 'in_progress' },
+      },
+      evidence: new Set<string>(),
+      abandon: ['1', '2'],
+      nudge: [] as string[],
+      drop: [] as string[],
+    },
+    {
+      name: 'gap stays open for one nudge',
+      reconciliations: {
+        '3': { reason: 'tests remain', kind: 'gap' as const, nudged: false },
+      },
+      tasks: { '3': { id: '3', status: 'in_progress' } },
+      evidence: new Set(['3']),
+      abandon: [] as string[],
+      nudge: ['3'],
+      drop: [] as string[],
+    },
+    {
+      name: 'missing-evidence that later has validation evidence is nudged not abandoned',
+      reconciliations: {
+        '4': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
+      },
+      tasks: { '4': { id: '4', status: 'pending' } },
+      evidence: new Set(['4']),
+      abandon: [] as string[],
+      nudge: ['4'],
+      drop: [] as string[],
+    },
+    {
+      name: 'completed or missing tasks are dropped',
+      reconciliations: {
+        '5': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
+        '6': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
+      },
+      tasks: { '5': { id: '5', status: 'completed' } },
+      evidence: new Set<string>(),
+      abandon: [] as string[],
+      nudge: [] as string[],
+      drop: ['5', '6'],
+    },
+  ];
+
+  for (const fixture of cases) {
+    const result = planSettledCompletionActions({
+      reconciliations: fixture.reconciliations,
+      tasks: fixture.tasks,
+      hasEvidence: (taskId) => fixture.evidence.has(taskId),
+    });
+    assert.deepEqual(
+      result.abandon.map((entry) => entry.taskId),
+      fixture.abandon,
+      fixture.name
+    );
+    assert.deepEqual(
+      result.nudge.map((entry) => entry.taskId),
+      fixture.nudge,
+      fixture.name
+    );
+    assert.deepEqual(result.drop, fixture.drop, fixture.name);
+  }
 });

@@ -1,4 +1,9 @@
-import type { AdvisorDecision, AdvisorSeverity, AdvisorState } from '../types.js';
+import type {
+  AdvisorDecision,
+  AdvisorSeverity,
+  AdvisorState,
+  CompletionRejectKind,
+} from '../types.js';
 
 export class CompletionAnalysisTimeoutError extends Error {
   constructor() {
@@ -51,8 +56,53 @@ export function reconcileActiveTools<T>(
   return Object.keys(activeTools);
 }
 
-export function completionCorrection(taskId: string, detail?: string): string {
-  return `Task #${taskId} remains active because Advisor could not verify completion${detail ? `: ${detail}` : '.'} Continue the work or add concrete evidence, then retry TaskUpdate.`;
+export const ABANDON_UNVERIFIED_TASK_EVENT = 'pi-advisor:abandon-unverified-task';
+
+export type { CompletionRejectKind };
+
+export type CompletionReconciliationEntry = {
+  reason: string;
+  kind: CompletionRejectKind;
+  nudged: boolean;
+};
+
+export type SettledCompletionActions = {
+  abandon: Array<CompletionReconciliationEntry & { taskId: string }>;
+  nudge: Array<CompletionReconciliationEntry & { taskId: string }>;
+  drop: string[];
+};
+
+const CLOSED_TASK_STATUSES = new Set(['completed', 'deleted', 'done']);
+
+export function completionCorrection(taskId: string, detail?: string, abandonHint = false): string {
+  const base = `Task #${taskId} remains active because Advisor could not verify completion${detail ? `: ${detail}` : '.'} Continue the work or add concrete evidence, then retry TaskUpdate.`;
+  if (!abandonHint) return base;
+  return `${base} If you cannot produce evidence, TaskUpdate status=deleted so the task does not remain open.`;
+}
+
+export function planSettledCompletionActions(args: {
+  reconciliations: Record<string, CompletionReconciliationEntry>;
+  tasks: Record<string, Record<string, unknown> | undefined>;
+  hasEvidence: (taskId: string, task: Record<string, unknown>) => boolean;
+}): SettledCompletionActions {
+  const abandon: SettledCompletionActions['abandon'] = [];
+  const nudge: SettledCompletionActions['nudge'] = [];
+  const drop: string[] = [];
+  for (const [taskId, recon] of Object.entries(args.reconciliations)) {
+    const task = args.tasks[taskId];
+    const status = typeof task?.status === 'string' ? task.status : undefined;
+    if (!task || CLOSED_TASK_STATUSES.has(status ?? '')) {
+      drop.push(taskId);
+      continue;
+    }
+    const entry = { taskId, ...recon };
+    if (recon.kind === 'missing-evidence' && !args.hasEvidence(taskId, task)) {
+      abandon.push(entry);
+      continue;
+    }
+    if (!recon.nudged) nudge.push(entry);
+  }
+  return { abandon, nudge, drop };
 }
 
 export type CompletionEmission = {

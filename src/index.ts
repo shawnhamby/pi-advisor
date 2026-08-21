@@ -14,10 +14,12 @@ import { Container, Text } from '@earendil-works/pi-tui';
 import { analyze } from './core/analyzer.js';
 import { IncrementalAdvisorQueue } from './core/background-queue.js';
 import {
+  ABANDON_UNVERIFIED_TASK_EVENT,
   COMPLETION_ANALYSIS_TIMEOUT_MS,
   completionEmission,
   completionCorrection,
   hasCompletionEvidence,
+  planSettledCompletionActions,
   reconcileActiveTools,
   withCompletionAnalysisTimeout,
 } from './core/completion-control.js';
@@ -42,6 +44,7 @@ import type {
   AdvisorHostOptions,
   AdvisorModelBinding,
   AdvisorSeverity,
+  CompletionRejectKind,
   InstructionReference,
   PlanBinding,
   ToolEvidence,
@@ -66,6 +69,8 @@ type BackgroundUpdate = {
   inputEpoch: number;
   semanticMatches: WatchMatch[];
 };
+
+export { ABANDON_UNVERIFIED_TASK_EVENT } from './core/completion-control.js';
 
 export function createAdvisorExtension(options: AdvisorHostOptions) {
   return function advisorExtension(pi: ExtensionAPI): void {
@@ -272,9 +277,13 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       substantial = true;
 
       const taskId = typeof input.taskId === 'string' ? input.taskId : '';
-      const reject = (reason: string, reconcile = true): ToolCallEventResult => {
+      const reject = (
+        reason: string,
+        reconcile = true,
+        kind: CompletionRejectKind = 'unavailable'
+      ): ToolCallEventResult => {
         if (reconcile) {
-          manager.setCompletionReconciliation(taskId, reason);
+          manager.setCompletionReconciliation(taskId, reason, kind);
           manager.persist();
         }
         return rejectCompletion(reason);
@@ -288,16 +297,24 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       const blockers = openTaskBlockers(manager.get().taskState, task);
       if (blockers.length) {
         return reject(
-          `Task #${taskId} is still blocked by ${blockers.map((id) => `#${id}`).join(', ')}. Resolve those tasks before retrying completion.`
+          `Task #${taskId} is still blocked by ${blockers.map((id) => `#${id}`).join(', ')}. Resolve those tasks before retrying completion.`,
+          true,
+          'blocked'
         );
       }
       if (!hasCompletionEvidence(task, manager.get())) {
-        return reject(completionCorrection(taskId, 'observed completion evidence is missing'));
+        return reject(
+          completionCorrection(taskId, 'observed completion evidence is missing', true),
+          true,
+          'missing-evidence'
+        );
       }
       const activeToolIds = reconcileActiveTools(manager.get().activeTools, pendingInputs.keys());
       if (activeToolIds.length > 0) {
         return reject(
-          `Task #${taskId} still has active tool work. Let it settle, verify the result, and retry completion.`
+          `Task #${taskId} still has active tool work. Let it settle, verify the result, and retry completion.`,
+          true,
+          'active-tools'
         );
       }
 
@@ -662,6 +679,41 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       for (const reminder of reminders) emit(reminderText(reminder), reminder.severity);
     });
 
+    const flushUnverifiedCompletions = (opts: { nudge: boolean; announce: boolean }): void => {
+      const records = taskRecords(manager.get().taskState) ?? {};
+      const tasks: Record<string, Record<string, unknown> | undefined> = {};
+      for (const [id, value] of Object.entries(records)) {
+        tasks[id] =
+          value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+      }
+      const actions = planSettledCompletionActions({
+        reconciliations: manager.completionReconciliations(),
+        tasks,
+        hasEvidence: (_taskId, task) => hasCompletionEvidence(task, manager.get()),
+      });
+      for (const taskId of actions.drop) manager.clearCompletionReconciliation(taskId);
+      for (const entry of actions.abandon) {
+        pi.events.emit(ABANDON_UNVERIFIED_TASK_EVENT, {
+          version: 1,
+          taskId: entry.taskId,
+          reason: entry.reason,
+        });
+        manager.clearCompletionReconciliation(entry.taskId);
+        if (opts.announce) {
+          emit(
+            `Task #${entry.taskId} was abandoned after an unverified completion. The task is no longer open.`,
+            'concern'
+          );
+        }
+      }
+      if (!opts.nudge) return;
+      for (const entry of actions.nudge) {
+        const message = `Task #${entry.taskId} remains active after a rejected completion: ${entry.reason} Resolve that gap from current evidence and retry TaskUpdate before yielding.`;
+        if (emit(message, 'concern', true))
+          manager.markCompletionReconciliationNudged(entry.taskId);
+      }
+    };
+
     pi.on('agent_settled', async (_event, ctx) => {
       if (!substantial || !manager.get().objective) return;
       if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
@@ -685,15 +737,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         manager.clearSemanticMatches();
         queuePrimaryDelta(ctx, false, semanticMatches);
       }
-      const reconciliation = manager.get().completionReconciliation;
-      if (task && reconciliation?.taskId === task.id && !reconciliation.nudged) {
-        const message = `Task #${task.id} remains active after a rejected completion: ${reconciliation.reason} Resolve that gap from current evidence and retry TaskUpdate before yielding.`;
-        if (!ctx.hasPendingMessages() && emit(message, 'concern', true)) {
-          manager.markCompletionReconciliationNudged(task.id);
-          manager.persist();
-          return;
-        }
-      }
+      flushUnverifiedCompletions({ nudge: !ctx.hasPendingMessages(), announce: true });
       manager.persist();
     });
 
@@ -748,6 +792,7 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
     });
     pi.on('session_shutdown', () => {
       completionSemantic.invalidate();
+      flushUnverifiedCompletions({ nudge: false, announce: false });
       if (watcher) manager.setWatchState(watcher.exportState());
       manager.persist();
       background.reset();

@@ -420,7 +420,9 @@ test('signature is key-stable and excludes Advisor bookkeeping', () => {
   const left = state();
   left.lastAnalysisAt = 1;
   left.lastEmissionAt = 2;
-  left.completionReconciliation = { taskId: '1', reason: 'old', nudged: true };
+  left.completionReconciliations = {
+    '1': { reason: 'old', kind: 'missing-evidence', nudged: true },
+  };
   const right = state();
   right.lastAnalysisAt = 99;
   right.lastEmissionAt = 100;

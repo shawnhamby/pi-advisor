@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import type { AdvisorState, PlanBinding, ToolEvidence } from '../types.js';
+import type { CompletionReconciliationEntry } from '../core/completion-control.js';
+import type { AdvisorState, CompletionRejectKind, PlanBinding, ToolEvidence } from '../types.js';
 import type { WatchEngineState, WatchMatch } from '../watch/types.js';
 import { normalizeAdvisorNote } from '../core/emission-guard.js';
 
@@ -29,6 +30,7 @@ export class AdvisorStateManager {
     this.state.trustedInputs ??= [];
     this.state.pendingSemanticMatches ??= [];
     this.state.activeTools = {};
+    normalizeCompletionReconciliations(this.state);
   }
 
   persist(): void {
@@ -48,7 +50,7 @@ export class AdvisorStateManager {
     this.state.lastTrustedInput = { text: trimmed, source, at: effectiveAt };
     this.state.trustedInputs.push({ text: trimmed, source, at: effectiveAt });
     this.state.continuationIssuedFor = undefined;
-    this.state.completionReconciliation = undefined;
+    this.state.completionReconciliations = undefined;
     this.state.pendingSemanticMatches = [];
     if (this.state.trustedInputs.length > MAX_TRUSTED_INPUTS) {
       this.state.trustedInputs.splice(0, this.state.trustedInputs.length - MAX_TRUSTED_INPUTS);
@@ -80,35 +82,60 @@ export class AdvisorStateManager {
   setTaskState(value: unknown, reason?: string): void {
     this.state.taskState = structuredClone(value);
     this.state.taskReason = reason;
-    const task = activeTask(value);
-    if (!task || task.id !== this.state.completionReconciliation?.taskId) {
-      this.state.completionReconciliation = undefined;
-    }
+    this.dropClosedCompletionReconciliations();
   }
 
-  setCompletionReconciliation(taskId: string, reason: string): void {
-    const prior = this.state.completionReconciliation;
+  completionReconciliations(): Record<string, CompletionReconciliationEntry> {
+    return { ...(this.state.completionReconciliations ?? {}) };
+  }
+
+  setCompletionReconciliation(taskId: string, reason: string, kind: CompletionRejectKind): void {
     const trimmed = reason.trim();
+    const prior = this.state.completionReconciliations?.[taskId];
     const sameReason =
-      prior?.taskId === taskId &&
-      normalizeAdvisorNote(prior.reason) === normalizeAdvisorNote(trimmed);
-    this.state.completionReconciliation = {
-      taskId,
-      reason: trimmed,
-      nudged: sameReason ? prior.nudged : false,
+      prior?.kind === kind && normalizeAdvisorNote(prior.reason) === normalizeAdvisorNote(trimmed);
+    this.state.completionReconciliations = {
+      ...this.state.completionReconciliations,
+      [taskId]: {
+        reason: trimmed,
+        kind,
+        nudged: sameReason ? prior.nudged : false,
+      },
     };
   }
 
   markCompletionReconciliationNudged(taskId: string): boolean {
-    const reconciliation = this.state.completionReconciliation;
-    if (reconciliation?.taskId !== taskId || reconciliation.nudged) return false;
+    const reconciliation = this.state.completionReconciliations?.[taskId];
+    if (!reconciliation || reconciliation.nudged) return false;
     reconciliation.nudged = true;
     return true;
   }
 
   clearCompletionReconciliation(taskId: string): void {
-    if (this.state.completionReconciliation?.taskId !== taskId) return;
-    this.state.completionReconciliation = undefined;
+    const current = this.state.completionReconciliations;
+    if (!current?.[taskId]) return;
+    const next = { ...current };
+    delete next[taskId];
+    this.state.completionReconciliations = Object.keys(next).length ? next : undefined;
+  }
+
+  dropClosedCompletionReconciliations(): void {
+    const current = this.state.completionReconciliations;
+    if (!current) return;
+    const records = taskRecords(this.state.taskState) ?? {};
+    const next: Record<string, CompletionReconciliationEntry> = {};
+    for (const [taskId, entry] of Object.entries(current)) {
+      const task = records[taskId];
+      const status =
+        task &&
+        typeof task === 'object' &&
+        typeof (task as { status?: unknown }).status === 'string'
+          ? (task as { status: string }).status
+          : undefined;
+      if (!task || status === 'completed' || status === 'deleted' || status === 'done') continue;
+      next[taskId] = entry;
+    }
+    this.state.completionReconciliations = Object.keys(next).length ? next : undefined;
   }
 
   setWatchState(value: WatchEngineState): void {
@@ -224,6 +251,69 @@ export function activeTask(value: unknown): { id: string; task: any } | undefine
       : tasks?.[id]
     : undefined;
   return task ? { id, task } : undefined;
+}
+
+function normalizeCompletionReconciliations(state: AdvisorState): void {
+  const next: Record<string, CompletionReconciliationEntry> = {
+    ...(state.completionReconciliations ?? {}),
+  };
+  const legacy = (
+    state as AdvisorState & {
+      completionReconciliation?: { taskId?: string; reason?: string; nudged?: boolean };
+    }
+  ).completionReconciliation;
+  if (
+    legacy &&
+    typeof legacy.taskId === 'string' &&
+    legacy.taskId &&
+    typeof legacy.reason === 'string'
+  ) {
+    next[legacy.taskId] ??= {
+      reason: legacy.reason,
+      kind: 'unavailable',
+      nudged: Boolean(legacy.nudged),
+    };
+  }
+  for (const [taskId, entry] of Object.entries(next)) {
+    if (!entry || typeof entry.reason !== 'string') {
+      delete next[taskId];
+      continue;
+    }
+    next[taskId] = {
+      reason: entry.reason,
+      kind: validRejectKind(entry.kind) ? entry.kind : 'unavailable',
+      nudged: Boolean(entry.nudged),
+    };
+  }
+  state.completionReconciliations = Object.keys(next).length ? next : undefined;
+  delete (state as { completionReconciliation?: unknown }).completionReconciliation;
+}
+
+function validRejectKind(value: unknown): value is CompletionRejectKind {
+  return (
+    value === 'missing-evidence' ||
+    value === 'gap' ||
+    value === 'blocked' ||
+    value === 'active-tools' ||
+    value === 'unavailable'
+  );
+}
+
+function taskRecords(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const event = value as { state?: unknown; tasks?: unknown };
+  const state = event.state ?? event;
+  if (!state || typeof state !== 'object') return undefined;
+  const tasks = (state as { tasks?: unknown }).tasks;
+  if (Array.isArray(tasks)) {
+    return Object.fromEntries(
+      tasks
+        .filter((task): task is Record<string, unknown> => !!task && typeof task === 'object')
+        .filter((task) => typeof task.id === 'string')
+        .map((task) => [String(task.id), task])
+    );
+  }
+  return tasks && typeof tasks === 'object' ? (tasks as Record<string, unknown>) : undefined;
 }
 
 function emptyState(): AdvisorState {
