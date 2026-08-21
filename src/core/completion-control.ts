@@ -56,6 +56,27 @@ export function reconcileActiveTools<T>(
   return Object.keys(activeTools);
 }
 
+export function shouldResumeBoundWork(input: {
+  hasPendingMessages: boolean;
+  liveToolCount: number;
+  substantial: boolean;
+  hasObjective: boolean;
+}): boolean {
+  return (
+    input.substantial &&
+    input.hasObjective &&
+    !input.hasPendingMessages &&
+    input.liveToolCount === 0
+  );
+}
+
+export function toolCallIdsRelated(left: string, right: string): boolean {
+  if (left === right) return true;
+  const leftParts = left.split('|').filter(Boolean);
+  const rightParts = right.split('|').filter(Boolean);
+  return leftParts.some((part) => rightParts.includes(part));
+}
+
 export const ABANDON_UNVERIFIED_TASK_EVENT = 'pi-advisor:abandon-unverified-task';
 
 export type { CompletionRejectKind };

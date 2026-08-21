@@ -8,6 +8,8 @@ import {
   hasTaskLocalCompletionEvidence,
   planSettledCompletionActions,
   reconcileActiveTools,
+  shouldResumeBoundWork,
+  toolCallIdsRelated,
   withCompletionAnalysisTimeout,
 } from '../src/core/completion-control.ts';
 
@@ -88,6 +90,64 @@ test('active-tool reconciliation removes terminal entries and preserves live wor
 
   assert.deepEqual(remaining, ['live']);
   assert.deepEqual(activeTools, { live: { name: 'edit' } });
+});
+
+test('active-tool reconciliation drops every entry when no calls are live', () => {
+  const activeTools = {
+    'call_a|fc_1': { name: 'herdr_agent' },
+    'call_b|fc_2': { name: 'herdr_pane' },
+  };
+
+  assert.deepEqual(reconcileActiveTools(activeTools, []), []);
+  assert.deepEqual(activeTools, {});
+});
+
+test('related tool ids match composite provider suffixes', () => {
+  assert.equal(
+    toolCallIdsRelated('call_a|fc_1', 'call_a|fc_1'),
+    true
+  );
+  assert.equal(toolCallIdsRelated('call_a', 'call_a|fc_1'), true);
+  assert.equal(toolCallIdsRelated('call_a|fc_1', 'call_b|fc_2'), false);
+});
+
+test('bound-work resume requires an objective, no live tools, and no pending input', () => {
+  assert.equal(
+    shouldResumeBoundWork({
+      hasPendingMessages: false,
+      liveToolCount: 0,
+      substantial: true,
+      hasObjective: true,
+    }),
+    true
+  );
+  assert.equal(
+    shouldResumeBoundWork({
+      hasPendingMessages: true,
+      liveToolCount: 0,
+      substantial: true,
+      hasObjective: true,
+    }),
+    false
+  );
+  assert.equal(
+    shouldResumeBoundWork({
+      hasPendingMessages: false,
+      liveToolCount: 2,
+      substantial: true,
+      hasObjective: true,
+    }),
+    false
+  );
+  assert.equal(
+    shouldResumeBoundWork({
+      hasPendingMessages: false,
+      liveToolCount: 0,
+      substantial: true,
+      hasObjective: false,
+    }),
+    false
+  );
 });
 
 test('missing completion evidence returns ordinary corrective feedback', () => {

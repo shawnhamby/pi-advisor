@@ -21,6 +21,8 @@ import {
   hasCompletionEvidence,
   planSettledCompletionActions,
   reconcileActiveTools,
+  shouldResumeBoundWork,
+  toolCallIdsRelated,
   withCompletionAnalysisTimeout,
 } from './core/completion-control.js';
 import {
@@ -659,6 +661,9 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         event.isError
       );
       pendingInputs.delete(event.toolCallId);
+      for (const id of [...pendingInputs.keys()]) {
+        if (toolCallIdsRelated(id, event.toolCallId)) pendingInputs.delete(id);
+      }
       const output = event.content
         .map((item) => (item.type === 'text' ? item.text : `[${item.type}]`))
         .join('\n');
@@ -673,6 +678,10 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         finishedAt: Date.now(),
       };
       manager.toolFinished(evidence);
+      for (const id of Object.keys(manager.get().activeTools)) {
+        if (toolCallIdsRelated(id, event.toolCallId))
+          delete manager.get().activeTools[id];
+      }
       if (MUTATION_TOOLS.test(event.toolName)) substantial = true;
       manager.persist();
       const resultMatches = await watch({
@@ -725,9 +734,13 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         nudge: !ctx.hasPendingMessages(),
         announce: true,
       });
+      const liveToolCount = reconcileActiveTools(
+        manager.get().activeTools,
+        pendingInputs.keys()
+      ).length;
       manager.persist();
       if (!substantial || !manager.get().objective) return;
-      if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
+      if (ctx.hasPendingMessages() || liveToolCount > 0) return;
       const task = activeTask(manager.get().taskState);
       await watch({
         source: 'lifecycle',
@@ -747,7 +760,24 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (semanticMatches.length) {
         manager.clearSemanticMatches();
         queuePrimaryDelta(ctx, false, semanticMatches);
+        return;
       }
+      if (
+        !shouldResumeBoundWork({
+          hasPendingMessages: ctx.hasPendingMessages(),
+          liveToolCount,
+          substantial,
+          hasObjective: Boolean(manager.get().objective),
+        })
+      )
+        return;
+      const signature = `settle-resume:${manager.get().objectiveUpdatedAt ?? 0}`;
+      if (!manager.markContinuation(signature)) return;
+      emit(
+        'Bound work remains after the last turn. Continue that objective now. Do not recap. Do not create a Task for work already running in this session.',
+        'concern',
+        true
+      );
     });
 
     const handleBackgroundDecision = (

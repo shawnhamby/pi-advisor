@@ -16,6 +16,7 @@ bounded, role-aware snapshots and changing the authority model:
 - a rejected completion is tracked per task, independent of `in_progress`;
 - a missing-evidence or non-converging (`unavailable`) completion that is still open at settle is abandoned through `pi-advisor:abandon-unverified-task`, so the widget cannot hang;
 - other rejected completions are still nudged once at settle so remaining work is not silently dropped;
+- `agent_settled` drops finished tool ids before deciding whether work is still live, then issues at most one bound-work continuation per trusted-input epoch;
 - direct user completion through `/tasks` remains user-authoritative and is reconciled after the transition;
 - messages are tagged Pi custom messages and never replay trusted user input;
 - an OMP-derived deterministic watch lane observes bounded text, thinking,
