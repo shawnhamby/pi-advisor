@@ -83,7 +83,6 @@ export function completionCorrection(taskId: string, detail?: string, abandonHin
 export function planSettledCompletionActions(args: {
   reconciliations: Record<string, CompletionReconciliationEntry>;
   tasks: Record<string, Record<string, unknown> | undefined>;
-  hasEvidence: (taskId: string, task: Record<string, unknown>) => boolean;
 }): SettledCompletionActions {
   const abandon: SettledCompletionActions['abandon'] = [];
   const nudge: SettledCompletionActions['nudge'] = [];
@@ -96,7 +95,7 @@ export function planSettledCompletionActions(args: {
       continue;
     }
     const entry = { taskId, ...recon };
-    if (recon.kind === 'missing-evidence' && !args.hasEvidence(taskId, task)) {
+    if (recon.kind === 'missing-evidence') {
       abandon.push(entry);
       continue;
     }

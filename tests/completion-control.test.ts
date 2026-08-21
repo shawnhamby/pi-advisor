@@ -192,7 +192,6 @@ test('settled unverified completes abandon missing-evidence tasks and keep gaps'
         '1': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
       },
       tasks: { '1': { id: '1', status: 'pending' } },
-      evidence: new Set<string>(),
       abandon: ['1'],
       nudge: [] as string[],
       drop: [] as string[],
@@ -207,7 +206,6 @@ test('settled unverified completes abandon missing-evidence tasks and keep gaps'
         '1': { id: '1', status: 'pending' },
         '2': { id: '2', status: 'in_progress' },
       },
-      evidence: new Set<string>(),
       abandon: ['1', '2'],
       nudge: [] as string[],
       drop: [] as string[],
@@ -218,20 +216,18 @@ test('settled unverified completes abandon missing-evidence tasks and keep gaps'
         '3': { reason: 'tests remain', kind: 'gap' as const, nudged: false },
       },
       tasks: { '3': { id: '3', status: 'in_progress' } },
-      evidence: new Set(['3']),
       abandon: [] as string[],
       nudge: ['3'],
       drop: [] as string[],
     },
     {
-      name: 'missing-evidence that later has validation evidence is nudged not abandoned',
+      name: 'missing-evidence is abandoned even if validation evidence later appeared',
       reconciliations: {
         '4': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
       },
       tasks: { '4': { id: '4', status: 'pending' } },
-      evidence: new Set(['4']),
-      abandon: [] as string[],
-      nudge: ['4'],
+      abandon: ['4'],
+      nudge: [] as string[],
       drop: [] as string[],
     },
     {
@@ -241,7 +237,6 @@ test('settled unverified completes abandon missing-evidence tasks and keep gaps'
         '6': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },
       },
       tasks: { '5': { id: '5', status: 'completed' } },
-      evidence: new Set<string>(),
       abandon: [] as string[],
       nudge: [] as string[],
       drop: ['5', '6'],
@@ -252,7 +247,6 @@ test('settled unverified completes abandon missing-evidence tasks and keep gaps'
     const result = planSettledCompletionActions({
       reconciliations: fixture.reconciliations,
       tasks: fixture.tasks,
-      hasEvidence: (taskId) => fixture.evidence.has(taskId),
     });
     assert.deepEqual(
       result.abandon.map((entry) => entry.taskId),

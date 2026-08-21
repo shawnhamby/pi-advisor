@@ -689,7 +689,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       const actions = planSettledCompletionActions({
         reconciliations: manager.completionReconciliations(),
         tasks,
-        hasEvidence: (_taskId, task) => hasCompletionEvidence(task, manager.get()),
       });
       for (const taskId of actions.drop) manager.clearCompletionReconciliation(taskId);
       for (const entry of actions.abandon) {
