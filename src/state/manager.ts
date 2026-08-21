@@ -66,7 +66,6 @@ export class AdvisorStateManager {
     if (!input) return false;
     this.state.objective = input.text;
     this.state.objectiveUpdatedAt = input.at;
-    this.state.continuationIssuedFor = undefined;
     this.persist();
     return true;
   }
