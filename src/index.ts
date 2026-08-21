@@ -380,18 +380,21 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       if (result.kind === 'cooldown') {
         return reject(
           `Task #${taskId} remains active because Advisor completion verification is temporarily unavailable. Do not retry TaskUpdate until the task evidence changes.`,
-          false
+          true,
+          'unavailable'
         );
       }
       if (!result.started) {
         return reject(
           `Task #${taskId} remains active while Advisor verification is already running. Do not retry TaskUpdate until Advisor reports the result.`,
-          false
+          true,
+          'unavailable'
         );
       }
       return reject(
         `Task #${taskId} remains active while Advisor verifies the current evidence asynchronously. Continue other work; Advisor will report the result.`,
-        false
+        true,
+        'unavailable'
       );
     };
 
@@ -902,6 +905,18 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
 
     function emitCompletionResult(taskId: string, decision: AdvisorDecision): void {
       const emission = completionEmission(taskId, decision);
+      if (decision.verdict === 'UNKNOWN') {
+        manager.setCompletionReconciliation(taskId, emission.message, 'unavailable');
+        manager.persist();
+        flushUnverifiedCompletions({ nudge: false, announce: true });
+        manager.persist();
+      } else if (decision.verdict === 'GAP') {
+        manager.setCompletionReconciliation(taskId, emission.message, 'gap');
+        manager.persist();
+      } else if (decision.verdict === 'PASS') {
+        manager.clearCompletionReconciliation(taskId);
+        manager.persist();
+      }
       emitCompletionMessage(
         emission.message,
         emission.severity,

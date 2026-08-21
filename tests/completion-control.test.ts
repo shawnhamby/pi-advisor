@@ -231,6 +231,20 @@ test('settled unverified completes abandon missing-evidence tasks and keep gaps'
       drop: [] as string[],
     },
     {
+      name: 'unavailable async/unknown verification is abandoned at settle',
+      reconciliations: {
+        '7': {
+          reason: 'did not converge',
+          kind: 'unavailable' as const,
+          nudged: false,
+        },
+      },
+      tasks: { '7': { id: '7', status: 'in_progress' } },
+      abandon: ['7'],
+      nudge: [] as string[],
+      drop: [] as string[],
+    },
+    {
       name: 'completed or missing tasks are dropped',
       reconciliations: {
         '5': { reason: 'missing', kind: 'missing-evidence' as const, nudged: false },

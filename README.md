@@ -14,7 +14,7 @@ bounded, role-aware snapshots and changing the authority model:
 - an unsupported completion attempt returns one corrective tool error without terminating or pausing the agent;
 - completion checks judge prerequisites at the tool's transition boundary rather than requiring effects that can occur only after the transition;
 - a rejected completion is tracked per task, independent of `in_progress`;
-- a missing-evidence completion that is still open at the next settled boundary is abandoned through `pi-advisor:abandon-unverified-task`, even if later evidence appeared without a successful complete, so the widget cannot hang;
+- a missing-evidence or non-converging (`unavailable`) completion that is still open at settle is abandoned through `pi-advisor:abandon-unverified-task`, so the widget cannot hang;
 - other rejected completions are still nudged once at settle so remaining work is not silently dropped;
 - direct user completion through `/tasks` remains user-authoritative and is reconciled after the transition;
 - messages are tagged Pi custom messages and never replay trusted user input;

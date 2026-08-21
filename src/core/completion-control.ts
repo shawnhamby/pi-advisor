@@ -95,7 +95,7 @@ export function planSettledCompletionActions(args: {
       continue;
     }
     const entry = { taskId, ...recon };
-    if (recon.kind === 'missing-evidence') {
+    if (recon.kind === 'missing-evidence' || recon.kind === 'unavailable') {
       abandon.push(entry);
       continue;
     }
