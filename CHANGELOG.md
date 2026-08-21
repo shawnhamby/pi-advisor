@@ -4,6 +4,7 @@
 
 - Abandon a missing-evidence `TaskUpdate status=completed` at `agent_settled` or shutdown instead of leaving the task open, including when evidence appeared later without a successful complete. Track every rejected task, not only the current `in_progress` one, and emit `pi-advisor:abandon-unverified-task` for pi-tasks to delete it.
 - Abandon completions whose isolated verification does not converge (`unavailable` / async UNKNOWN). A live leftover-4a complete stayed `in_progress` after "verifies asynchronously" plus "did not converge" because that path never tagged settle-abandon.
+- Emit abandon on the rejected `TaskUpdate` itself, and flush at the start of `agent_settled`, so a hung widget does not wait on a later settle that `/reload` in a long-lived Pi process may never run with new code.
 
 - Add a generic OMP-derived deterministic watch engine for bounded assistant,
   tool, task, and lifecycle streams.

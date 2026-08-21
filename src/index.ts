@@ -139,6 +139,40 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       return true;
     };
 
+    const flushUnverifiedCompletions = (opts: { nudge: boolean; announce: boolean }): void => {
+      const records = taskRecords(manager.get().taskState) ?? {};
+      const tasks: Record<string, Record<string, unknown> | undefined> = {};
+      for (const [id, value] of Object.entries(records)) {
+        tasks[id] =
+          value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+      }
+      const actions = planSettledCompletionActions({
+        reconciliations: manager.completionReconciliations(),
+        tasks,
+      });
+      for (const taskId of actions.drop) manager.clearCompletionReconciliation(taskId);
+      for (const entry of actions.abandon) {
+        pi.events.emit(ABANDON_UNVERIFIED_TASK_EVENT, {
+          version: 1,
+          taskId: entry.taskId,
+          reason: entry.reason,
+        });
+        manager.clearCompletionReconciliation(entry.taskId);
+        if (opts.announce) {
+          emit(
+            `Task #${entry.taskId} was abandoned after an unverified completion. The task is no longer open.`,
+            'concern'
+          );
+        }
+      }
+      if (!opts.nudge) return;
+      for (const entry of actions.nudge) {
+        const message = `Task #${entry.taskId} remains active after a rejected completion: ${entry.reason} Resolve that gap from current evidence and retry TaskUpdate before yielding.`;
+        if (emit(message, 'concern', true))
+          manager.markCompletionReconciliationNudged(entry.taskId);
+      }
+    };
+
     const emitCompletionMessage = (
       message: string,
       severity: AdvisorSeverity,
@@ -285,6 +319,10 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         if (reconcile) {
           manager.setCompletionReconciliation(taskId, reason, kind);
           manager.persist();
+          if (kind === 'missing-evidence' || kind === 'unavailable') {
+            flushUnverifiedCompletions({ nudge: false, announce: true });
+            manager.persist();
+          }
         }
         return rejectCompletion(reason);
       };
@@ -682,41 +720,12 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
       for (const reminder of reminders) emit(reminderText(reminder), reminder.severity);
     });
 
-    const flushUnverifiedCompletions = (opts: { nudge: boolean; announce: boolean }): void => {
-      const records = taskRecords(manager.get().taskState) ?? {};
-      const tasks: Record<string, Record<string, unknown> | undefined> = {};
-      for (const [id, value] of Object.entries(records)) {
-        tasks[id] =
-          value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
-      }
-      const actions = planSettledCompletionActions({
-        reconciliations: manager.completionReconciliations(),
-        tasks,
-      });
-      for (const taskId of actions.drop) manager.clearCompletionReconciliation(taskId);
-      for (const entry of actions.abandon) {
-        pi.events.emit(ABANDON_UNVERIFIED_TASK_EVENT, {
-          version: 1,
-          taskId: entry.taskId,
-          reason: entry.reason,
-        });
-        manager.clearCompletionReconciliation(entry.taskId);
-        if (opts.announce) {
-          emit(
-            `Task #${entry.taskId} was abandoned after an unverified completion. The task is no longer open.`,
-            'concern'
-          );
-        }
-      }
-      if (!opts.nudge) return;
-      for (const entry of actions.nudge) {
-        const message = `Task #${entry.taskId} remains active after a rejected completion: ${entry.reason} Resolve that gap from current evidence and retry TaskUpdate before yielding.`;
-        if (emit(message, 'concern', true))
-          manager.markCompletionReconciliationNudged(entry.taskId);
-      }
-    };
-
     pi.on('agent_settled', async (_event, ctx) => {
+      flushUnverifiedCompletions({
+        nudge: !ctx.hasPendingMessages(),
+        announce: true,
+      });
+      manager.persist();
       if (!substantial || !manager.get().objective) return;
       if (ctx.hasPendingMessages() || Object.keys(manager.get().activeTools).length > 0) return;
       const task = activeTask(manager.get().taskState);
@@ -739,8 +748,6 @@ export function createAdvisorExtension(options: AdvisorHostOptions) {
         manager.clearSemanticMatches();
         queuePrimaryDelta(ctx, false, semanticMatches);
       }
-      flushUnverifiedCompletions({ nudge: !ctx.hasPendingMessages(), announce: true });
-      manager.persist();
     });
 
     const handleBackgroundDecision = (
